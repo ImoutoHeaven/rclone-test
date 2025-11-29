@@ -345,6 +345,8 @@ func (f *Fs) put(ctx context.Context, in io.Reader, src fs.ObjectInfo, _ []fs.Op
 	}
 	full := f.fullPath(src.Remote())
 	size := src.Size()
+	modTime := src.ModTime(ctx)
+	fs.Debugf(f, "upload start path=%s size=%d", full, size)
 	cacheFile, cleanup, err := f.ensureCacheFile(ctx, in, size)
 	if err != nil {
 		return nil, err
@@ -356,15 +358,16 @@ func (f *Fs) put(ctx context.Context, in io.Reader, src fs.ObjectInfo, _ []fs.Op
 		}()
 	}
 	sliceSize := f.getSliceSize(size)
-	modTime := src.ModTime(ctx)
 	contentMd5, sliceMd5, blockList, err := computeHashes(cacheFile, size, sliceSize)
 	if err != nil {
 		return nil, err
 	}
+	fs.Debugf(f, "upload hashes path=%s content-md5=%s slice-md5=%s blocks=%d sliceSize=%d", full, contentMd5, sliceMd5, len(blockList), sliceSize)
 	blockListStr, _ := json.Marshal(blockList)
 
 	// rapid upload
 	if obj, err := f.putRapid(ctx, full, size, contentMd5, modTime, blockListStr); err == nil {
+		fs.Debugf(f, "rapid upload hit path=%s size=%d", full, size)
 		return obj, nil
 	}
 
@@ -377,16 +380,20 @@ func (f *Fs) put(ctx context.Context, in io.Reader, src fs.ObjectInfo, _ []fs.Op
 		if err != nil {
 			return nil, err
 		}
+		fs.Debugf(f, "precreate new path=%s uploadid=%s returnType=%d blocks=%d", full, precreate.UploadID, precreate.ReturnType, len(precreate.BlockList))
 		if precreate.ReturnType == 2 {
 			info := precreate.File.toObjectInfo(f.root)
 			return f.newObject(info), nil
 		}
+	} else {
+		fs.Debugf(f, "resume upload from cache path=%s uploadid=%s pending=%d", full, precreate.UploadID, countPending(precreate.BlockList))
 	}
 	if precreate.UploadURL == "" {
 		precreate.UploadURL = f.getUploadURL(full, precreate.UploadID)
 	}
 
 	for retry := 0; retry < 2; retry++ {
+		fs.Debugf(f, "upload parts path=%s uploadid=%s attempt=%d pending=%d", full, precreate.UploadID, retry, countPending(precreate.BlockList))
 		err = f.uploadParts(ctx, precreate, cacheFile, full, path.Base(full), size, sliceSize)
 		if err == nil {
 			break
@@ -408,14 +415,18 @@ func (f *Fs) put(ctx context.Context, in io.Reader, src fs.ObjectInfo, _ []fs.Op
 			precreate.UploadURL = f.getUploadURL(full, precreate.UploadID)
 			continue
 		}
+		fs.Debugf(f, "upload parts failed path=%s uploadid=%s err=%v", full, precreate.UploadID, err)
 		return nil, err
 	}
 	f.progressStore.Save(key, nil)
 
+	fs.Debugf(f, "calling create path=%s uploadid=%s blocks=%d", full, precreate.UploadID, len(blockList))
 	fileInfo, err := f.apiCreate(ctx, full, size, 0, precreate.UploadID, string(blockListStr), ctime, mtime)
 	if err != nil {
+		fs.Debugf(f, "create failed path=%s uploadid=%s err=%v", full, precreate.UploadID, err)
 		return nil, err
 	}
+	fs.Debugf(f, "create ok path=%s fsid=%d size=%d", full, fileInfo.FsID, fileInfo.Size)
 	info := fileInfo.toObjectInfo(f.root)
 	return f.newObject(info), nil
 }
@@ -680,6 +691,17 @@ func filterUnfinished(parts []int) []int {
 		}
 	}
 	return out
+}
+
+// countPending returns number of parts not marked as finished (-1).
+func countPending(parts []int) int {
+	count := 0
+	for _, p := range parts {
+		if p >= 0 {
+			count++
+		}
+	}
+	return count
 }
 
 // Fs returns the parent Fs.
