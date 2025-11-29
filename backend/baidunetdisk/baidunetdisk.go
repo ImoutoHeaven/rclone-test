@@ -50,6 +50,10 @@ var (
 	_ fs.Fs          = (*Fs)(nil)
 	_ fs.PutStreamer = (*Fs)(nil)
 	_ fs.Object      = (*Object)(nil)
+	_ fs.Copier      = (*Fs)(nil)
+	_ fs.Mover       = (*Fs)(nil)
+	_ fs.DirMover    = (*Fs)(nil)
+	_ fs.Purger      = (*Fs)(nil)
 )
 
 func init() {
@@ -181,6 +185,69 @@ func (f *Fs) Mkdir(ctx context.Context, dir string) error {
 // Rmdir removes an empty directory.
 func (f *Fs) Rmdir(ctx context.Context, dir string) error {
 	return f.deletePath(ctx, f.fullPath(dir))
+}
+
+// Purge deletes all files under dir (server side delete).
+func (f *Fs) Purge(ctx context.Context, dir string) error {
+	return f.deletePath(ctx, f.fullPath(dir))
+}
+
+// Copy performs server-side copy using filemanager copy.
+func (f *Fs) Copy(ctx context.Context, src fs.Object, remote string) (fs.Object, error) {
+	srcObj, ok := src.(*Object)
+	if !ok {
+		return nil, fs.ErrorCantCopy
+	}
+	srcPath := f.fullPath(srcObj.Remote())
+	dstFull := f.fullPath(remote)
+	dstDir := path.Dir(dstFull)
+	newName := path.Base(dstFull)
+	err := f.manage(ctx, "copy", []map[string]string{{
+		"path":    srcPath,
+		"dest":    dstDir,
+		"newname": newName,
+	}})
+	if err != nil {
+		return nil, err
+	}
+	return f.NewObject(ctx, remote)
+}
+
+// Move performs server-side move.
+func (f *Fs) Move(ctx context.Context, src fs.Object, remote string) (fs.Object, error) {
+	srcObj, ok := src.(*Object)
+	if !ok {
+		return nil, fs.ErrorCantMove
+	}
+	srcPath := f.fullPath(srcObj.Remote())
+	dstFull := f.fullPath(remote)
+	dstDir := path.Dir(dstFull)
+	newName := path.Base(dstFull)
+	err := f.manage(ctx, "move", []map[string]string{{
+		"path":    srcPath,
+		"dest":    dstDir,
+		"newname": newName,
+	}})
+	if err != nil {
+		return nil, err
+	}
+	return f.NewObject(ctx, remote)
+}
+
+// DirMove moves a directory server-side.
+func (f *Fs) DirMove(ctx context.Context, src fs.Fs, srcRemote, dstRemote string) error {
+	if src.Name() != f.Name() {
+		return fs.ErrorCantDirMove
+	}
+	srcPath := f.fullPath(srcRemote)
+	dstFull := f.fullPath(dstRemote)
+	dstDir := path.Dir(dstFull)
+	newName := path.Base(dstFull)
+	return f.manage(ctx, "move", []map[string]string{{
+		"path":    srcPath,
+		"dest":    dstDir,
+		"newname": newName,
+	}})
 }
 
 // Put uploads object.
@@ -493,14 +560,22 @@ func (f *Fs) ensureCacheFile(ctx context.Context, in io.Reader, size int64) (*os
 
 // delete path using filemanager delete.
 func (f *Fs) deletePath(ctx context.Context, fullPath string) error {
-	params := url.Values{"method": {"filemanager"}, "opera": {"delete"}}
-	listStr, _ := json.Marshal([]string{fullPath})
+	return f.manage(ctx, "delete", []string{fullPath})
+}
+
+// manage wraps filemanager opera.
+func (f *Fs) manage(ctx context.Context, opera string, filelist any) error {
+	params := url.Values{"method": {"filemanager"}, "opera": {opera}}
+	listStr, err := json.Marshal(filelist)
+	if err != nil {
+		return err
+	}
 	form := url.Values{
 		"async":    {"0"},
 		"filelist": {string(listStr)},
 		"ondup":    {"fail"},
 	}
-	_, err := f.apiPostForm(ctx, "/xpan/file", params, form, nil)
+	_, err = f.apiPostForm(ctx, "/xpan/file", params, form, nil)
 	return err
 }
 
