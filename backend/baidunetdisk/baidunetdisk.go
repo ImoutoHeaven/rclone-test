@@ -117,7 +117,7 @@ func (f *Fs) Features() *fs.Features { return f.features }
 // UserInfo returns quota info.
 func (f *Fs) UserInfo(ctx context.Context) (map[string]string, error) {
 	var quota QuotaResp
-	if _, err := f.apiGet(ctx, "https://pan.baidu.com/api/quota", url.Values{}, &quota); err != nil {
+	if _, err := f.apiRequest(ctx, http.MethodGet, "https://pan.baidu.com/api/quota", url.Values{}, nil, "", &quota); err != nil {
 		return nil, err
 	}
 	return map[string]string{
