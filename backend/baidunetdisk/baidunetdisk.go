@@ -112,8 +112,10 @@ func (f *Fs) Root() string { return strings.TrimPrefix(f.root, "/") }
 // String returns description.
 func (f *Fs) String() string { return fmt.Sprintf("Baidu Netdisk root '%s'", f.root) }
 
-// Precision returns modtime precision
-func (f *Fs) Precision() time.Duration { return time.Second }
+// Precision returns modtime precision. Baidu Netdisk does not provide a
+// reliable file modification time, so advertise modtime as unsupported and
+// let rclone fall back to size-only comparisons.
+func (f *Fs) Precision() time.Duration { return fs.ModTimeNotSupported }
 
 // Hashes returns supported hash types.
 // Baidu's reported MD5 for superfile2 uploads is not a reliable end-to-end
