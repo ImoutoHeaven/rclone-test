@@ -253,6 +253,13 @@ func getOptions(m configmap.Mapper) (*Options, error) {
 
 // refreshToken refreshes access + refresh token with retry on empty token.
 func (f *Fs) refreshToken(ctx context.Context) error {
+	f.tokenMu.Lock()
+	defer f.tokenMu.Unlock()
+	return f.refreshTokenLocked(ctx)
+}
+
+// refreshTokenLocked performs single token refresh with caller holding tokenMu.
+func (f *Fs) refreshTokenLocked(ctx context.Context) error {
 	err := f.refreshTokenOnce(ctx)
 	if err != nil && errors.Is(err, errEmptyToken) {
 		return f.refreshTokenOnce(ctx)
@@ -260,7 +267,7 @@ func (f *Fs) refreshToken(ctx context.Context) error {
 	return err
 }
 
-// refreshTokenOnce performs single token refresh.
+// refreshTokenOnce performs single token refresh. Caller must hold tokenMu.
 func (f *Fs) refreshTokenOnce(ctx context.Context) error {
 	if f.opt.UseOnlineAPI && f.opt.APIAddress != "" {
 		u, _ := url.Parse(f.opt.APIAddress)
@@ -384,7 +391,7 @@ func (f *Fs) apiRequest(ctx context.Context, method, fullURL string, params url.
 				q.Add(k, item)
 			}
 		}
-		q.Set("access_token", f.accessToken)
+		q.Set("access_token", f.getAccessToken())
 		req.URL.RawQuery = q.Encode()
 		resp, err := f.client.Do(req)
 		if err != nil {
@@ -565,6 +572,8 @@ func (f *Fs) getUploadURL(_ string, _ string) string {
 
 // ensureAccessToken ensures we have an access token.
 func (f *Fs) ensureAccessToken(ctx context.Context) error {
+	f.tokenMu.Lock()
+	defer f.tokenMu.Unlock()
 	if f.accessToken != "" {
 		return nil
 	}
@@ -572,10 +581,17 @@ func (f *Fs) ensureAccessToken(ctx context.Context) error {
 		f.accessToken = f.opt.AccessToken
 		return nil
 	}
-	return f.refreshToken(ctx)
+	return f.refreshTokenLocked(ctx)
 }
 
 // newHTTPClient creates configured http client.
 func newHTTPClient(ctx context.Context) *http.Client {
 	return fshttp.NewClient(ctx)
+}
+
+// getAccessToken returns current access token under lock.
+func (f *Fs) getAccessToken() string {
+	f.tokenMu.Lock()
+	defer f.tokenMu.Unlock()
+	return f.accessToken
 }

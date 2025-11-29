@@ -36,6 +36,7 @@ type Fs struct {
 	client      *http.Client
 	accessToken string
 	vipType     int
+	tokenMu     sync.Mutex
 
 	progressStore *uploadProgressStore
 }
@@ -388,7 +389,7 @@ func (f *Fs) put(ctx context.Context, in io.Reader, src fs.ObjectInfo, _ []fs.Op
 
 	ctime := modTime.Unix()
 	mtime := modTime.Unix()
-	key := contentMd5 + "_" + f.accessToken
+	key := contentMd5 + "_" + f.getAccessToken()
 	precreate, ok := f.progressStore.Load(key)
 	if !ok {
 		precreate, err = f.apiPrecreate(ctx, full, size, string(blockListStr), contentMd5, sliceMd5, ctime, mtime)
@@ -554,7 +555,7 @@ func (f *Fs) uploadSlice(ctx context.Context, uploadURL, fullPath, uploadID, fil
 	q.Set("path", fullPath)
 	q.Set("uploadid", uploadID)
 	q.Set("partseq", strconv.Itoa(partSeq))
-	q.Set("access_token", f.accessToken)
+	q.Set("access_token", f.getAccessToken())
 	req.URL.RawQuery = q.Encode()
 	req.Header.Set("Content-Type", mw.FormDataContentType())
 	req.ContentLength = int64(head.Len()) + size + int64(tail.Len())
@@ -845,7 +846,7 @@ func (o *Object) fetchDownloadLink(ctx context.Context) (string, error) {
 	if meta.List[0].Dlink == "" {
 		return "", errors.New("baidunetdisk: empty dlink returned")
 	}
-	dl := fmt.Sprintf("%s&access_token=%s", meta.List[0].Dlink, o.fs.accessToken)
+	dl := fmt.Sprintf("%s&access_token=%s", meta.List[0].Dlink, o.fs.getAccessToken())
 	return dl, nil
 }
 
