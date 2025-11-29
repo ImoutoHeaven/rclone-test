@@ -470,8 +470,10 @@ func (f *Fs) putRapid(ctx context.Context, fullPath string, size int64, contentM
 
 // uploadParts uploads all pending parts concurrently with per-slice retry.
 func (f *Fs) uploadParts(ctx context.Context, pre *PrecreateResp, file *os.File, fullPath, fileName string, totalSize, sliceSize int64) error {
-	totalParts := len(pre.BlockList)
-	if totalParts == 0 {
+	// Calculate actual part count based on file size, not BlockList length
+	// BlockList may be filtered during retry, but the total part count never changes
+	count := int((totalSize + sliceSize - 1) / sliceSize)
+	if len(pre.BlockList) == 0 {
 		return nil
 	}
 	lastBlockSize := totalSize % sliceSize
@@ -493,7 +495,7 @@ func (f *Fs) uploadParts(ctx context.Context, pre *PrecreateResp, file *os.File,
 			defer func() { <-sem }()
 			offset := int64(partSeq) * sliceSize
 			partSize := sliceSize
-			if partSeq+1 == totalParts {
+			if partSeq+1 == count {
 				partSize = lastBlockSize
 			}
 			var attemptErr error
