@@ -143,10 +143,17 @@ rclone-bd config
 
 - 只使用官方 API：
   - `xpan/multimedia?method=filemetas&fsids=[...]&dlink=1` 获取 `dlink`；
-  - 拼接 `dlink + access_token` 后先发 `HEAD` 请求，禁止自动跟随重定向；
-  - 从 `Location` 拿到真实下载 URL；
-  - 用单线程 `GET` 下载整个文件，携带 `User-Agent: pan.baidu.com`，不做多范围并发或本地再分片下载。
-- 下载逻辑与 OpenList 的 `baidu_netdisk` driver 保持一致：一条流、一条官方链路。
+  - 拼接 `dlink + access_token` 后先发 `HEAD` 请求，禁止自动跟随重定向，从 `Location` 拿到真实下载 URL；
+  - 对真实 URL 发 `GET` 请求，携带 `User-Agent: pan.baidu.com`，始终走官方下载链路（不使用 crack/crack_video 等非官方接口）。
+- Range / 多线程支持（对齐 rclone 官方语义）：
+  - `Object.Open` 支持 rclone 的 `RangeOption`，通过 `Range` 头把“只下载某一段 bytes”的需求下沉到 Baidu 官方 HTTP 链路；
+  - 配合 `--multi-thread-streams` / `--multi-thread-cutoff` 等参数，由 rclone 主程序负责把一个对象拆成多个 Range，并发调用多次 `Open`，本后端每次仍是一条官方 GET；
+  - 后端自身不做“本地再分片”或额外的多线程调度，只提供稳定的 Range 支持。
+- 下载错误处理与重试：
+  - 对 `filemetas`、HEAD、GET 的错误响应体尝试解析 Baidu 的 JSON 错误（`errno` / `error_code` / `errmsg` / `request_id`）；
+  - 遇到 `31045`（access_token 失效）时，会自动调用配置好的在线 API 或官方 OAuth 刷新 token，然后重新执行一次完整的 `filemetas + HEAD + GET`；
+  - 遇到 `31360`（dlink 过期）或 `31362`（签名错误）时，会重新调用 `filemetas` 获取新的 dlink，再重试下载；
+  - 遇到 `31326`（防盗链）时不会盲目重试，而是直接返回错误，保留 errno / status / request_id 方便排查。
 - 不实现 / 不迁移以下 OpenList 特性：
   - 各种 crack / crack_video 等非官方下载接口；
   - only_list_video_file 等特定业务行为。
