@@ -109,6 +109,9 @@ func (f File) toObjectInfo(root string) objectInfo {
 
 // decryptMd5 converts baidu md5 (possibly encrypted) to plain md5.
 func decryptMd5(encryptMd5 string) string {
+	if len(encryptMd5) < 16 {
+		return ""
+	}
 	if _, err := hex.DecodeString(encryptMd5); err == nil && len(encryptMd5) == 32 {
 		return encryptMd5
 	}
