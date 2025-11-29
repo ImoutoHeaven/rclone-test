@@ -40,6 +40,15 @@ const (
 	sliceStep               int64 = 1 * 1024 * 1024
 )
 
+// errnoError wraps baidu errno so callers can inspect it.
+type errnoError struct {
+	code int
+}
+
+func (e errnoError) Error() string {
+	return fmt.Sprintf("baidunetdisk api error: errno=%d", e.code)
+}
+
 // Options defines backend configuration.
 type Options struct {
 	RefreshToken           string        `config:"refresh_token"`
@@ -403,7 +412,7 @@ func (f *Fs) apiRequest(ctx context.Context, method, fullURL string, params url.
 				time.Sleep(time.Second << attempt)
 				continue
 			}
-			return nil, fmt.Errorf("baidunetdisk api error: errno=%d", errno.Errno)
+			return nil, errnoError{code: errno.Errno}
 		}
 		if out != nil {
 			if err := json.Unmarshal(data, out); err != nil {

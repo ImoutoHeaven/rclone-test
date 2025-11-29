@@ -89,6 +89,12 @@ func NewFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, e
 		return nil, err
 	}
 	f.vipType = vip
+	if err := f.adjustRoot(ctx); err != nil {
+		if errors.Is(err, fs.ErrorIsFile) {
+			return f, fs.ErrorIsFile
+		}
+		return nil, err
+	}
 	f.features = (&fs.Features{
 		CaseInsensitive:         false,
 		CanHaveEmptyDirectories: true,
@@ -173,6 +179,10 @@ func (f *Fs) List(ctx context.Context, dir string) (entries fs.DirEntries, err e
 		}
 		var resp ListResp
 		if _, err = f.apiGet(ctx, "/xpan/file", params, &resp); err != nil {
+			var ee errnoError
+			if errors.As(err, &ee) && ee.code == -9 {
+				return entries, nil
+			}
 			return nil, err
 		}
 		if len(resp.List) == 0 {
@@ -193,6 +203,56 @@ func (f *Fs) List(ctx context.Context, dir string) (entries fs.DirEntries, err e
 		start += limit
 	}
 	return entries, nil
+}
+
+// adjustRoot detects whether the configured root points to an existing file.
+// If so, it rewinds root to parent and signals fs.ErrorIsFile per rclone convention.
+func (f *Fs) adjustRoot(ctx context.Context) error {
+	if f.root == "/" {
+		return nil
+	}
+	cleanRoot := f.root
+	parent := path.Dir(cleanRoot)
+	if parent == "." {
+		parent = "/"
+	}
+	leaf := path.Base(cleanRoot)
+
+	start := 0
+	limit := 200
+	for {
+		params := url.Values{
+			"method": {"list"},
+			"dir":    {parent},
+			"web":    {"web"},
+			"start":  {strconv.Itoa(start)},
+			"limit":  {strconv.Itoa(limit)},
+		}
+		var resp ListResp
+		if _, err := f.apiGet(ctx, "/xpan/file", params, &resp); err != nil {
+			var ee errnoError
+			if errors.As(err, &ee) && ee.code == -9 {
+				// parent not found; treat as new path, keep current root
+				return nil
+			}
+			return err
+		}
+		if len(resp.List) == 0 {
+			return nil
+		}
+		for _, item := range resp.List {
+			if item.ServerFilename == leaf || path.Base(item.Path) == leaf {
+				if item.Isdir == 0 {
+					f.root = parent
+					return fs.ErrorIsFile
+				}
+				// leaf is directory; keep original root
+				f.root = cleanRoot
+				return nil
+			}
+		}
+		start += limit
+	}
 }
 
 // Mkdir is noop (Baidu create happens during upload/create).
