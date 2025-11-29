@@ -38,7 +38,7 @@ type File struct {
 	Ctime          int64  `json:"ctime"`
 	Mtime          int64  `json:"mtime"`
 	Thumbs         struct {
-		Url3 string `json:"url3"`
+		URL3 string `json:"url3"`
 	} `json:"thumbs"`
 }
 
@@ -67,19 +67,11 @@ type PrecreateResp struct {
 	UploadURL  string `json:"-"` // cached upload domain for resume
 }
 
-// quota response
+// QuotaResp is response for quota endpoint.
 type QuotaResp struct {
 	Errno int    `json:"errno"`
 	Total uint64 `json:"total"`
 	Used  uint64 `json:"used"`
-}
-
-// Objects convert helper
-func (f File) toRemotePath(root string) string {
-	if f.Path != "" {
-		return strings.TrimPrefix(f.Path, root)
-	}
-	return ""
 }
 
 func (f File) ensureTimes() File {
@@ -111,7 +103,7 @@ func (f File) toObjectInfo(root string) objectInfo {
 		ctime:    time.Unix(f.ServerCtime, 0),
 		isDir:    f.Isdir == 1,
 		md5:      decryptMd5(f.Md5),
-		thumbURL: f.Thumbs.Url3,
+		thumbURL: f.Thumbs.URL3,
 	}
 }
 

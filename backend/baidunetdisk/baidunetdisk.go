@@ -422,7 +422,7 @@ func (f *Fs) uploadParts(ctx context.Context, pre *PrecreateResp, file *os.File,
 				}
 				if attempt < f.opt.UploadRetryCount {
 					time.Sleep(wait)
-					wait = wait * 2
+					wait *= 2
 					if wait > f.opt.UploadRetryMaxWait {
 						wait = f.opt.UploadRetryMaxWait
 					}
@@ -439,7 +439,9 @@ func (f *Fs) uploadSlice(ctx context.Context, uploadURL, fullPath, uploadID, fil
 	pr, pw := io.Pipe()
 	mw := multipart.NewWriter(pw)
 	go func() {
-		defer pw.Close()
+		defer func() {
+			_ = pw.Close()
+		}()
 		part, err := mw.CreateFormFile("file", fileName)
 		if err != nil {
 			_ = pw.CloseWithError(err)
@@ -476,7 +478,9 @@ func (f *Fs) uploadSlice(ctx context.Context, uploadURL, fullPath, uploadID, fil
 	if err != nil {
 		return err
 	}
-	defer resp.Body.Close()
+	defer func() {
+		_ = resp.Body.Close()
+	}()
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
 		return err
@@ -618,7 +622,7 @@ func filterUnfinished(parts []int) []int {
 	return out
 }
 
-// FsInfo needed by Object interface.
+// Fs returns the parent Fs.
 func (o *Object) Fs() fs.Info { return o.fs }
 
 // Remote path.
@@ -675,7 +679,7 @@ func (o *Object) Open(ctx context.Context, options ...fs.OpenOption) (io.ReadClo
 	if err != nil {
 		return nil, err
 	}
-	resp.Body.Close()
+	_ = resp.Body.Close()
 	location := resp.Header.Get("Location")
 	if location == "" {
 		location = dl

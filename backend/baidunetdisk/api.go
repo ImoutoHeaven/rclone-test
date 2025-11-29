@@ -42,23 +42,23 @@ const (
 
 // Options defines backend configuration.
 type Options struct {
-	RefreshToken          string        `config:"refresh_token"`
-	ClientID              string        `config:"client_id"`
-	ClientSecret          string        `config:"client_secret"`
-	UseOnlineAPI          bool          `config:"use_online_api"`
-	APIAddress            string        `config:"api_url_address"`
-	UploadThread          int           `config:"upload_thread"`
-	UploadTimeout         time.Duration `config:"upload_timeout"`
-	UploadAPI             string        `config:"upload_api"`
-	UseDynamicUploadAPI   bool          `config:"use_dynamic_upload_api"`
-	CustomUploadPartSize  int64         `config:"custom_upload_part_size"`
-	LowBandwithUploadMode bool          `config:"low_bandwith_upload_mode"`
-	UploadRetryCount      int           `config:"upload_retry_count"`
-	UploadRetryWait       time.Duration `config:"upload_retry_initial_wait"`
-	UploadRetryMaxWait    time.Duration `config:"upload_retry_max_wait"`
-	AccessToken           string        `config:"access_token"`
-	OrderBy               string        `config:"order_by"`
-	OrderDirection        string        `config:"order_direction"`
+	RefreshToken           string        `config:"refresh_token"`
+	ClientID               string        `config:"client_id"`
+	ClientSecret           string        `config:"client_secret"`
+	UseOnlineAPI           bool          `config:"use_online_api"`
+	APIAddress             string        `config:"api_url_address"`
+	UploadThread           int           `config:"upload_thread"`
+	UploadTimeout          time.Duration `config:"upload_timeout"`
+	UploadAPI              string        `config:"upload_api"`
+	UseDynamicUploadAPI    bool          `config:"use_dynamic_upload_api"`
+	CustomUploadPartSize   int64         `config:"custom_upload_part_size"`
+	LowBandwidthUploadMode bool          `config:"low_bandwith_upload_mode"`
+	UploadRetryCount       int           `config:"upload_retry_count"`
+	UploadRetryWait        time.Duration `config:"upload_retry_initial_wait"`
+	UploadRetryMaxWait     time.Duration `config:"upload_retry_max_wait"`
+	AccessToken            string        `config:"access_token"`
+	OrderBy                string        `config:"order_by"`
+	OrderDirection         string        `config:"order_direction"`
 }
 
 // uploadProgressStore persists upload progress on disk (per content-md5 + access_token).
@@ -268,7 +268,9 @@ func (f *Fs) refreshTokenOnce(ctx context.Context) error {
 		if err != nil {
 			return err
 		}
-		defer resp.Body.Close()
+		defer func() {
+			_ = resp.Body.Close()
+		}()
 		var out struct {
 			RefreshToken string `json:"refresh_token"`
 			AccessToken  string `json:"access_token"`
@@ -307,7 +309,9 @@ func (f *Fs) refreshTokenOnce(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	defer resp.Body.Close()
+	defer func() {
+		_ = resp.Body.Close()
+	}()
 	var token struct {
 		AccessToken  string `json:"access_token"`
 		RefreshToken string `json:"refresh_token"`
@@ -372,7 +376,7 @@ func (f *Fs) apiRequest(ctx context.Context, method, fullURL string, params url.
 			continue
 		}
 		data, err := io.ReadAll(resp.Body)
-		resp.Body.Close()
+		_ = resp.Body.Close()
 		if err != nil {
 			lastErr = err
 			time.Sleep(time.Second << attempt)
@@ -464,7 +468,7 @@ func (f *Fs) getSliceSize(filesize int64) int64 {
 		maxSlice = svipSliceSize
 	}
 
-	if f.opt.LowBandwithUploadMode {
+	if f.opt.LowBandwidthUploadMode {
 		size := defaultSliceSize
 		for size <= maxSlice {
 			if filesize <= maxSliceNum*size {
