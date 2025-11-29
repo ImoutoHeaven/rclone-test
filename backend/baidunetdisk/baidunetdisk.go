@@ -58,6 +58,15 @@ var (
 	_ fs.UserInfoer  = (*Fs)(nil)
 )
 
+const (
+	baiduErrAccessTokenInvalid = 31045
+	baiduErrAntiHotlink        = 31326
+	baiduErrSignature          = 31362
+	baiduErrDlinkExpired       = 31360
+
+	maxDownloadErrorBody = 32 * 1024
+)
+
 func init() {
 	fs.Register(&fs.RegInfo{
 		Name:        "baidunetdisk",
@@ -740,8 +749,87 @@ func (o *Object) SetModTime(ctx context.Context, t time.Time) error { return fs.
 // Storable indicates can store.
 func (o *Object) Storable() bool { return true }
 
-// Open downloads object.
-func (o *Object) Open(ctx context.Context, options ...fs.OpenOption) (io.ReadCloser, error) {
+type baiduErrorBody struct {
+	Errno     int    `json:"errno"`
+	ErrorCode int    `json:"error_code"`
+	ErrMsg    string `json:"errmsg"`
+	ErrorMsg  string `json:"error_msg"`
+	RequestID string `json:"request_id"`
+}
+
+type baiduDownloadError struct {
+	statusCode int
+	errno      int
+	message    string
+	requestID  string
+}
+
+func (e baiduDownloadError) Error() string {
+	parts := make([]string, 0, 3)
+	if e.errno != 0 {
+		parts = append(parts, fmt.Sprintf("errno=%d", e.errno))
+	}
+	if e.statusCode != 0 {
+		parts = append(parts, fmt.Sprintf("status=%d", e.statusCode))
+	}
+	if e.message != "" {
+		parts = append(parts, e.message)
+	}
+	if len(parts) == 0 {
+		return "baidunetdisk download error"
+	}
+	return strings.Join(parts, ": ")
+}
+
+func (e baiduDownloadError) needsTokenRefresh() bool {
+	return e.errno == baiduErrAccessTokenInvalid
+}
+
+func (e baiduDownloadError) needsDlinkRefresh() bool {
+	return e.errno == baiduErrDlinkExpired || e.errno == baiduErrSignature
+}
+
+func (e baiduDownloadError) isAntiHotlink() bool {
+	return e.errno == baiduErrAntiHotlink
+}
+
+func parseBaiduDownloadError(resp *http.Response) baiduDownloadError {
+	data, _ := io.ReadAll(io.LimitReader(resp.Body, maxDownloadErrorBody))
+	var payload baiduErrorBody
+	_ = json.Unmarshal(data, &payload)
+	errno := payload.Errno
+	if errno == 0 {
+		errno = payload.ErrorCode
+	}
+	message := payload.ErrMsg
+	if message == "" {
+		message = payload.ErrorMsg
+	}
+	if message == "" {
+		message = strings.TrimSpace(string(data))
+	}
+	requestID := payload.RequestID
+	if requestID == "" {
+		requestID = resp.Header.Get("X-Bce-Request-Id")
+	}
+	return baiduDownloadError{
+		statusCode: resp.StatusCode,
+		errno:      errno,
+		message:    message,
+		requestID:  requestID,
+	}
+}
+
+func isAccessTokenError(err error) bool {
+	var ee errnoError
+	if errors.As(err, &ee) && ee.code == baiduErrAccessTokenInvalid {
+		return true
+	}
+	var de baiduDownloadError
+	return errors.As(err, &de) && de.errno == baiduErrAccessTokenInvalid
+}
+
+func (o *Object) fetchDownloadLink(ctx context.Context) (string, error) {
 	var meta DownloadResp
 	params := url.Values{
 		"method": {"filemetas"},
@@ -749,40 +837,150 @@ func (o *Object) Open(ctx context.Context, options ...fs.OpenOption) (io.ReadClo
 		"dlink":  {"1"},
 	}
 	if _, err := o.fs.apiGet(ctx, "/xpan/multimedia", params, &meta); err != nil {
-		return nil, err
+		return "", err
 	}
 	if len(meta.List) == 0 {
-		return nil, fs.ErrorObjectNotFound
+		return "", fs.ErrorObjectNotFound
+	}
+	if meta.List[0].Dlink == "" {
+		return "", errors.New("baidunetdisk: empty dlink returned")
 	}
 	dl := fmt.Sprintf("%s&access_token=%s", meta.List[0].Dlink, o.fs.accessToken)
+	return dl, nil
+}
+
+func (o *Object) resolveDownloadLocation(ctx context.Context, dlink string) (string, error) {
 	client := *o.fs.client
 	client.CheckRedirect = func(req *http.Request, via []*http.Request) error {
 		return http.ErrUseLastResponse
 	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodHead, dl, nil)
+	req, err := http.NewRequestWithContext(ctx, http.MethodHead, dlink, nil)
 	if err != nil {
-		return nil, err
+		return "", err
 	}
 	req.Header.Set("User-Agent", "pan.baidu.com")
 	resp, err := client.Do(req)
 	if err != nil {
-		return nil, err
+		return "", err
 	}
-	_ = resp.Body.Close()
+	defer resp.Body.Close()
+	if resp.StatusCode >= http.StatusBadRequest {
+		return "", parseBaiduDownloadError(resp)
+	}
 	location := resp.Header.Get("Location")
 	if location == "" {
-		location = dl
+		location = dlink
 	}
+	return location, nil
+}
+
+func (o *Object) doDownload(ctx context.Context, location string, headers map[string]string) (io.ReadCloser, error) {
 	getReq, err := http.NewRequestWithContext(ctx, http.MethodGet, location, nil)
 	if err != nil {
 		return nil, err
 	}
-	getReq.Header.Set("User-Agent", "pan.baidu.com")
-	resp, err = o.fs.client.Do(getReq)
+	for k, v := range headers {
+		getReq.Header.Set(k, v)
+	}
+	resp, err := o.fs.client.Do(getReq)
 	if err != nil {
 		return nil, err
 	}
+	if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices {
+		defer resp.Body.Close()
+		return nil, parseBaiduDownloadError(resp)
+	}
 	return resp.Body, nil
+}
+
+// Open downloads object with Range/error handling aligned with rclone expectations.
+func (o *Object) Open(ctx context.Context, options ...fs.OpenOption) (io.ReadCloser, error) {
+	fs.FixRangeOption(options, o.Size())
+	headers := fs.OpenOptionHeaders(options)
+	if headers == nil {
+		headers = make(map[string]string)
+	}
+	headers["User-Agent"] = "pan.baidu.com"
+
+	var (
+		dlink            string
+		needDlink        = true
+		needTokenRefresh bool
+		lastErr          error
+	)
+
+	for attempt := 0; attempt < 3; attempt++ {
+		if needTokenRefresh {
+			if err := o.fs.refreshToken(ctx); err != nil {
+				return nil, fmt.Errorf("refresh access token: %w", err)
+			}
+			needTokenRefresh = false
+			needDlink = true
+		}
+
+		if needDlink {
+			link, err := o.fetchDownloadLink(ctx)
+			if err != nil {
+				if isAccessTokenError(err) && !needTokenRefresh {
+					fs.Debugf(o, "filemetas errno=%d, refreshing token and retrying download", baiduErrAccessTokenInvalid)
+					needTokenRefresh = true
+					lastErr = err
+					continue
+				}
+				return nil, err
+			}
+			dlink = link
+			needDlink = false
+		}
+
+		location, err := o.resolveDownloadLocation(ctx, dlink)
+		if err != nil {
+			if de, ok := err.(baiduDownloadError); ok {
+				fs.Debugf(o, "download HEAD error: status=%d errno=%d request_id=%s msg=%s", de.statusCode, de.errno, de.requestID, de.message)
+				if de.needsTokenRefresh() && !needTokenRefresh {
+					needTokenRefresh = true
+					lastErr = err
+					continue
+				}
+				if de.needsDlinkRefresh() && !needDlink {
+					needDlink = true
+					lastErr = err
+					continue
+				}
+				if de.isAntiHotlink() {
+					return nil, err
+				}
+			}
+			return nil, err
+		}
+
+		body, err := o.doDownload(ctx, location, headers)
+		if err == nil {
+			return body, nil
+		}
+		if de, ok := err.(baiduDownloadError); ok {
+			fs.Debugf(o, "download GET error: status=%d errno=%d request_id=%s msg=%s", de.statusCode, de.errno, de.requestID, de.message)
+			if de.needsTokenRefresh() && !needTokenRefresh {
+				needTokenRefresh = true
+				lastErr = err
+				continue
+			}
+			if de.needsDlinkRefresh() && !needDlink {
+				needDlink = true
+				lastErr = err
+				continue
+			}
+			if de.isAntiHotlink() {
+				return nil, err
+			}
+		}
+		return nil, err
+	}
+
+	if lastErr != nil {
+		return nil, lastErr
+	}
+	return nil, errors.New("baidunetdisk: failed to open object for download")
 }
 
 // Update re-uploads.
