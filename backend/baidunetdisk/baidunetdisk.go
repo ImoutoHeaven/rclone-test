@@ -54,6 +54,7 @@ var (
 	_ fs.Mover       = (*Fs)(nil)
 	_ fs.DirMover    = (*Fs)(nil)
 	_ fs.Purger      = (*Fs)(nil)
+	_ fs.UserInfoer  = (*Fs)(nil)
 )
 
 func init() {
@@ -113,6 +114,18 @@ func (f *Fs) Hashes() hash.Set { return hash.Set(hash.MD5) }
 // Features returns optional features.
 func (f *Fs) Features() *fs.Features { return f.features }
 
+// UserInfo returns quota info.
+func (f *Fs) UserInfo(ctx context.Context) (map[string]string, error) {
+	var quota QuotaResp
+	if _, err := f.apiGet(ctx, "https://pan.baidu.com/api/quota", url.Values{}, &quota); err != nil {
+		return nil, err
+	}
+	return map[string]string{
+		"total": strconv.FormatUint(quota.Total, 10),
+		"used":  strconv.FormatUint(quota.Used, 10),
+	}, nil
+}
+
 // fullPath with root.
 func (f *Fs) fullPath(remote string) string {
 	if remote == "" {
@@ -151,6 +164,12 @@ func (f *Fs) List(ctx context.Context, dir string) (entries fs.DirEntries, err e
 			"web":    {"web"},
 			"start":  {strconv.Itoa(start)},
 			"limit":  {strconv.Itoa(limit)},
+		}
+		if f.opt.OrderBy != "" {
+			params.Set("order", f.opt.OrderBy)
+			if f.opt.OrderDirection == "desc" {
+				params.Set("desc", "1")
+			}
 		}
 		var resp ListResp
 		if _, err = f.apiGet(ctx, "/xpan/file", params, &resp); err != nil {

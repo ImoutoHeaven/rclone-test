@@ -57,6 +57,8 @@ type Options struct {
 	UploadRetryWait       time.Duration `config:"upload_retry_initial_wait"`
 	UploadRetryMaxWait    time.Duration `config:"upload_retry_max_wait"`
 	AccessToken           string        `config:"access_token"`
+	OrderBy               string        `config:"order_by"`
+	OrderDirection        string        `config:"order_direction"`
 }
 
 // uploadProgressStore persists upload progress on disk (per content-md5 + access_token).
@@ -173,6 +175,16 @@ var configOptions = []fs.Option{{
 	Help:     "Max backoff for slice retry.",
 	Default:  fs.Duration(defaultRetryMaxWait),
 	Advanced: true,
+}, {
+	Name:     "order_by",
+	Help:     "List ordering field (name|time|size).",
+	Default:  "name",
+	Advanced: true,
+}, {
+	Name:     "order_direction",
+	Help:     "List ordering direction (asc|desc).",
+	Default:  "asc",
+	Advanced: true,
 }}
 
 // setDefaults normalises options and fills defaults.
@@ -203,6 +215,20 @@ func (o *Options) setDefaults() {
 	}
 	if o.UploadRetryMaxWait == 0 {
 		o.UploadRetryMaxWait = defaultRetryMaxWait
+	}
+	if o.OrderBy == "" {
+		o.OrderBy = "name"
+	}
+	switch o.OrderBy {
+	case "name", "time", "size":
+	default:
+		o.OrderBy = "name"
+	}
+	if o.OrderDirection == "" {
+		o.OrderDirection = "asc"
+	}
+	if o.OrderDirection != "asc" && o.OrderDirection != "desc" {
+		o.OrderDirection = "asc"
 	}
 }
 
