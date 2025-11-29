@@ -1,6 +1,7 @@
 package baidunetdisk
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -309,9 +310,21 @@ func (f *Fs) apiRequest(ctx context.Context, method, fullURL string, params url.
 	if err := f.ensureAccessToken(ctx); err != nil {
 		return nil, err
 	}
+	var bodyBuf []byte
+	if body != nil {
+		var err error
+		bodyBuf, err = io.ReadAll(body)
+		if err != nil {
+			return nil, err
+		}
+	}
 	var lastErr error
 	for attempt := 0; attempt < 3; attempt++ {
-		req, err := http.NewRequestWithContext(ctx, method, fullURL, body)
+		var reqBody io.Reader
+		if bodyBuf != nil {
+			reqBody = bytes.NewReader(bodyBuf)
+		}
+		req, err := http.NewRequestWithContext(ctx, method, fullURL, reqBody)
 		if err != nil {
 			return nil, err
 		}
@@ -332,8 +345,8 @@ func (f *Fs) apiRequest(ctx context.Context, method, fullURL string, params url.
 			time.Sleep(time.Second << attempt)
 			continue
 		}
-		defer resp.Body.Close()
 		data, err := io.ReadAll(resp.Body)
+		resp.Body.Close()
 		if err != nil {
 			lastErr = err
 			time.Sleep(time.Second << attempt)
