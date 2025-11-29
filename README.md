@@ -145,7 +145,8 @@ rclone-bd config
   - `xpan/multimedia?method=filemetas&fsids=[...]&dlink=1` 获取 `dlink`；
   - 拼接 `dlink + access_token` 后先发 `HEAD` 请求，禁止自动跟随重定向；
   - 从 `Location` 拿到真实下载 URL；
-  - 用 `GET` 下载，携带 `User-Agent: pan.baidu.com`。
+  - 用单线程 `GET` 下载整个文件，携带 `User-Agent: pan.baidu.com`，不做多范围并发或本地再分片下载。
+- 下载逻辑与 OpenList 的 `baidu_netdisk` driver 保持一致：一条流、一条官方链路。
 - 不实现 / 不迁移以下 OpenList 特性：
   - 各种 crack / crack_video 等非官方下载接口；
   - only_list_video_file 等特定业务行为。
