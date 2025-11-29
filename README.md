@@ -1,184 +1,237 @@
-<!-- markdownlint-disable-next-line first-line-heading no-inline-html -->
-[<img src="https://rclone.org/img/logo_on_light__horizontal_color.svg" width="50%" alt="rclone logo">](https://rclone.org/#gh-light-mode-only)
-<!-- markdownlint-disable-next-line no-inline-html -->
-[<img src="https://rclone.org/img/logo_on_dark__horizontal_color.svg" width="50%" alt="rclone logo">](https://rclone.org/#gh-dark-mode-only)
+# rclone baidunetdisk 后端（baidu-upload-mod 分支）
 
-[Website](https://rclone.org) |
-[Documentation](https://rclone.org/docs/) |
-[Download](https://rclone.org/downloads/) |
-[Contributing](CONTRIBUTING.md) |
-[Changelog](https://rclone.org/changelog/) |
-[Installation](https://rclone.org/install/) |
-[Forum](https://forum.rclone.org/)
+本分支在官方 rclone 基础上，增加了一个专门面向百度网盘的后端 `baidunetdisk`。  
+目标是：在 rclone 中 1:1 复刻 OpenList / alist 魔改版的百度网盘上传下载行为，用于大文件批量同步。
 
-[![Build Status](https://github.com/rclone/rclone/workflows/build/badge.svg)](https://github.com/rclone/rclone/actions?query=workflow%3Abuild)
-[![Go Report Card](https://goreportcard.com/badge/github.com/rclone/rclone)](https://goreportcard.com/report/github.com/rclone/rclone)
-[![GoDoc](https://godoc.org/github.com/rclone/rclone?status.svg)](https://godoc.org/github.com/rclone/rclone)
-[![Docker Pulls](https://img.shields.io/docker/pulls/rclone/rclone)](https://hub.docker.com/r/rclone/rclone)
+> 警告：这是非官方后端，接口策略完全受百度控制。建议自用，避免高风险场景。
 
-# Rclone
+---
 
-Rclone *("rsync for cloud storage")* is a command-line program to sync files and
-directories to and from different cloud storage providers.
+## 功能概览
 
-## Storage providers
+- 新增存储后端：`baidunetdisk`
+  - 支持普通文件/目录的上传、下载、列目录。
+  - 支持服务器端的 `Copy` / `Move` / `DirMove` / `Purge` 等高级操作。
+- 上传特性
+  - 优先尝试秒传（rapid upload）。
+  - 否则使用 `precreate + superfile2` 分片上传，支持断点续传。
+  - 每个分片有独立重试机制（指数退避）。
+  - 上传进度按 `content-md5 + access_token` 落盘，可跨进程恢复。
+- 下载特性
+  - 使用官方 `xpan/multimedia?method=filemetas` 流程获取下载链接。
+  - 强制带 `User-Agent: pan.baidu.com`，兼容官方客户端链路。
+- 与百度特性对齐的限制
+  - **不提供可靠 MD5 校验和**（百度的 MD5 非真正内容 MD5）。
+  - **不提供可靠 mtime**（百度返回的是上传时刻，而非文件原始修改时间）。
+  - rclone 在此后端上等价于 **“按文件名 + 大小判断是否一致”**。
 
-- 1Fichier [:page_facing_up:](https://rclone.org/fichier/)
-- Akamai Netstorage [:page_facing_up:](https://rclone.org/netstorage/)
-- Alibaba Cloud (Aliyun) Object Storage System (OSS) [:page_facing_up:](https://rclone.org/s3/#alibaba-oss)
-- Amazon S3 [:page_facing_up:](https://rclone.org/s3/)
-- ArvanCloud Object Storage (AOS) [:page_facing_up:](https://rclone.org/s3/#arvan-cloud-object-storage-aos)
-- Backblaze B2 [:page_facing_up:](https://rclone.org/b2/)
-- Box [:page_facing_up:](https://rclone.org/box/)
-- Ceph [:page_facing_up:](https://rclone.org/s3/#ceph)
-- China Mobile Ecloud Elastic Object Storage (EOS) [:page_facing_up:](https://rclone.org/s3/#china-mobile-ecloud-eos)
-- Cloudflare R2 [:page_facing_up:](https://rclone.org/s3/#cloudflare-r2)
-- Citrix ShareFile [:page_facing_up:](https://rclone.org/sharefile/)
-- Cubbit DS3 [:page_facing_up:](https://rclone.org/s3/#Cubbit)
-- DigitalOcean Spaces [:page_facing_up:](https://rclone.org/s3/#digitalocean-spaces)
-- Digi Storage [:page_facing_up:](https://rclone.org/koofr/#digi-storage)
-- Dreamhost [:page_facing_up:](https://rclone.org/s3/#dreamhost)
-- Dropbox [:page_facing_up:](https://rclone.org/dropbox/)
-- Enterprise File Fabric [:page_facing_up:](https://rclone.org/filefabric/)
-- Exaba [:page_facing_up:](https://rclone.org/s3/#exaba)
-- Fastmail Files [:page_facing_up:](https://rclone.org/webdav/#fastmail-files)
-- FileLu [:page_facing_up:](https://rclone.org/filelu/)
-- Files.com [:page_facing_up:](https://rclone.org/filescom/)
-- FlashBlade [:page_facing_up:](https://rclone.org/s3/#pure-storage-flashblade)
-- FTP [:page_facing_up:](https://rclone.org/ftp/)
-- GoFile [:page_facing_up:](https://rclone.org/gofile/)
-- Google Cloud Storage [:page_facing_up:](https://rclone.org/googlecloudstorage/)
-- Google Drive [:page_facing_up:](https://rclone.org/drive/)
-- Google Photos [:page_facing_up:](https://rclone.org/googlephotos/)
-- HDFS (Hadoop Distributed Filesystem) [:page_facing_up:](https://rclone.org/hdfs/)
-- Hetzner Object Storage [:page_facing_up:](https://rclone.org/s3/#hetzner)
-- Hetzner Storage Box [:page_facing_up:](https://rclone.org/sftp/#hetzner-storage-box)
-- HiDrive [:page_facing_up:](https://rclone.org/hidrive/)
-- HTTP [:page_facing_up:](https://rclone.org/http/)
-- Huawei Cloud Object Storage Service(OBS) [:page_facing_up:](https://rclone.org/s3/#huawei-obs)
-- iCloud Drive [:page_facing_up:](https://rclone.org/iclouddrive/)
-- ImageKit [:page_facing_up:](https://rclone.org/imagekit/)
-- Internet Archive [:page_facing_up:](https://rclone.org/internetarchive/)
-- Jottacloud [:page_facing_up:](https://rclone.org/jottacloud/)
-- IBM COS S3 [:page_facing_up:](https://rclone.org/s3/#ibm-cos-s3)
-- Intercolo Object Storage [:page_facing_up:](https://rclone.org/s3/#intercolo)
-- IONOS Cloud [:page_facing_up:](https://rclone.org/s3/#ionos)
-- Koofr [:page_facing_up:](https://rclone.org/koofr/)
-- Leviia Object Storage [:page_facing_up:](https://rclone.org/s3/#leviia)
-- Liara Object Storage [:page_facing_up:](https://rclone.org/s3/#liara-object-storage)
-- Linkbox [:page_facing_up:](https://rclone.org/linkbox)
-- Linode Object Storage [:page_facing_up:](https://rclone.org/s3/#linode)
-- Magalu Object Storage [:page_facing_up:](https://rclone.org/s3/#magalu)
-- Mail.ru Cloud [:page_facing_up:](https://rclone.org/mailru/)
-- Memset Memstore [:page_facing_up:](https://rclone.org/swift/)
-- MEGA [:page_facing_up:](https://rclone.org/mega/)
-- MEGA S4 Object Storage [:page_facing_up:](https://rclone.org/s3/#mega)
-- Memory [:page_facing_up:](https://rclone.org/memory/)
-- Microsoft Azure Blob Storage [:page_facing_up:](https://rclone.org/azureblob/)
-- Microsoft Azure Files Storage [:page_facing_up:](https://rclone.org/azurefiles/)
-- Microsoft OneDrive [:page_facing_up:](https://rclone.org/onedrive/)
-- Minio [:page_facing_up:](https://rclone.org/s3/#minio)
-- Nextcloud [:page_facing_up:](https://rclone.org/webdav/#nextcloud)
-- Blomp Cloud Storage [:page_facing_up:](https://rclone.org/swift/)
-- OpenDrive [:page_facing_up:](https://rclone.org/opendrive/)
-- OpenStack Swift [:page_facing_up:](https://rclone.org/swift/)
-- Oracle Cloud Storage [:page_facing_up:](https://rclone.org/swift/)
-- Oracle Object Storage [:page_facing_up:](https://rclone.org/oracleobjectstorage/)
-- Outscale [:page_facing_up:](https://rclone.org/s3/#outscale)
-- OVHcloud Object Storage (Swift) [:page_facing_up:](https://rclone.org/swift/)
-- OVHcloud Object Storage (S3-compatible) [:page_facing_up:](https://rclone.org/s3/#ovhcloud)
-- ownCloud [:page_facing_up:](https://rclone.org/webdav/#owncloud)
-- pCloud [:page_facing_up:](https://rclone.org/pcloud/)
-- Petabox [:page_facing_up:](https://rclone.org/s3/#petabox)
-- PikPak [:page_facing_up:](https://rclone.org/pikpak/)
-- Pixeldrain [:page_facing_up:](https://rclone.org/pixeldrain/)
-- premiumize.me [:page_facing_up:](https://rclone.org/premiumizeme/)
-- put.io [:page_facing_up:](https://rclone.org/putio/)
-- Proton Drive [:page_facing_up:](https://rclone.org/protondrive/)
-- QingStor [:page_facing_up:](https://rclone.org/qingstor/)
-- Qiniu Cloud Object Storage (Kodo) [:page_facing_up:](https://rclone.org/s3/#qiniu)
-- Rabata Cloud Storage [:page_facing_up:](https://rclone.org/s3/#Rabata)
-- Quatrix [:page_facing_up:](https://rclone.org/quatrix/)
-- Rackspace Cloud Files [:page_facing_up:](https://rclone.org/swift/)
-- RackCorp Object Storage [:page_facing_up:](https://rclone.org/s3/#RackCorp)
-- rsync.net [:page_facing_up:](https://rclone.org/sftp/#rsync-net)
-- Scaleway [:page_facing_up:](https://rclone.org/s3/#scaleway)
-- Seafile [:page_facing_up:](https://rclone.org/seafile/)
-- Seagate Lyve Cloud [:page_facing_up:](https://rclone.org/s3/#lyve)
-- SeaweedFS [:page_facing_up:](https://rclone.org/s3/#seaweedfs)
-- Selectel Object Storage [:page_facing_up:](https://rclone.org/s3/#selectel)
-- Servercore Object Storage [:page_facing_up:](https://rclone.org/s3/#servercore)
-- SFTP [:page_facing_up:](https://rclone.org/sftp/)
-- SMB / CIFS [:page_facing_up:](https://rclone.org/smb/)
-- Spectra Logic [:page_facing_up:](https://rclone.org/s3/#spectralogic)
-- StackPath [:page_facing_up:](https://rclone.org/s3/#stackpath)
-- Storj [:page_facing_up:](https://rclone.org/storj/)
-- SugarSync [:page_facing_up:](https://rclone.org/sugarsync/)
-- Synology C2 Object Storage [:page_facing_up:](https://rclone.org/s3/#synology-c2)
-- Tencent Cloud Object Storage (COS) [:page_facing_up:](https://rclone.org/s3/#tencent-cos)
-- Uloz.to [:page_facing_up:](https://rclone.org/ulozto/)
-- Wasabi [:page_facing_up:](https://rclone.org/s3/#wasabi)
-- WebDAV [:page_facing_up:](https://rclone.org/webdav/)
-- Yandex Disk [:page_facing_up:](https://rclone.org/yandex/)
-- Zoho WorkDrive [:page_facing_up:](https://rclone.org/zoho/)
-- Zata.ai [:page_facing_up:](https://rclone.org/s3/#Zata)
-- The local filesystem [:page_facing_up:](https://rclone.org/local/)
+---
 
-Please see [the full list of all storage providers and their features](https://rclone.org/overview/)
+## 配置方式
 
-### Virtual storage providers
+通过 `rclone config` 创建一个 `baidunetdisk` 远端，例如：
 
-These backends adapt or modify other storage providers
+```bash
+rclone-bd config
+  > n) New remote
+  > name> baidu-main
+  > Storage> baidunetdisk
+```
 
-- Alias: rename existing remotes [:page_facing_up:](https://rclone.org/alias/)
-- Archive: read archive files [:page_facing_up:](https://rclone.org/archive/)
-- Cache: cache remotes (DEPRECATED) [:page_facing_up:](https://rclone.org/cache/)
-- Chunker: split large files [:page_facing_up:](https://rclone.org/chunker/)
-- Combine: combine multiple remotes into a directory tree [:page_facing_up:](https://rclone.org/combine/)
-- Compress: compress files [:page_facing_up:](https://rclone.org/compress/)
-- Crypt: encrypt files [:page_facing_up:](https://rclone.org/crypt/)
-- Hasher: hash files [:page_facing_up:](https://rclone.org/hasher/)
-- Union: join multiple remotes to work together [:page_facing_up:](https://rclone.org/union/)
+### 核心配置项
 
-## Features
+这些选项在 `rclone config` 中会以“高级选项”的形式出现：
 
-- MD5/SHA-1 hashes checked at all times for file integrity
-- Timestamps preserved on files
-- Partial syncs supported on a whole file basis
-- [Copy](https://rclone.org/commands/rclone_copy/) mode to just copy new/changed
-  files
-- [Sync](https://rclone.org/commands/rclone_sync/) (one way) mode to make a directory
-  identical
-- [Bisync](https://rclone.org/bisync/) (two way) to keep two directories in sync
-  bidirectionally
-- [Check](https://rclone.org/commands/rclone_check/) mode to check for file hash
-  equality
-- Can sync to and from network, e.g. two different cloud accounts
-- Optional large file chunking ([Chunker](https://rclone.org/chunker/))
-- Optional transparent compression ([Compress](https://rclone.org/compress/))
-- Optional encryption ([Crypt](https://rclone.org/crypt/))
-- Optional FUSE mount ([rclone mount](https://rclone.org/commands/rclone_mount/))
-- Multi-threaded downloads to local disk
-- Can [serve](https://rclone.org/commands/rclone_serve/) local or remote files
-  over HTTP/WebDAV/FTP/SFTP/DLNA
+- `refresh_token`（必填）
+  - 百度网盘 OAuth 的 refresh token。
+  - 通常从 OpenList / 其它工具导出，或者走一次手动 OAuth。
 
-## Installation & documentation
+- `client_id` / `client_secret`（可选，高级）
+  - 当 `use_online_api = false` 时，用于直接调用百度官方 OAuth 刷新 token。
 
-Please see the [rclone website](https://rclone.org/) for:
+- `use_online_api`（默认 `true`，高级）
+  - `true`：通过在线 API 刷新 token（默认使用 OpenList API：`https://api.oplist.org/baiduyun/renewapi`）。
+  - `false`：直接调用百度官方 `oauth/2.0/token` 刷新。
 
-- [Installation](https://rclone.org/install/)
-- [Documentation & configuration](https://rclone.org/docs/)
-- [Changelog](https://rclone.org/changelog/)
-- [FAQ](https://rclone.org/faq/)
-- [Storage providers](https://rclone.org/overview/)
-- [Forum](https://forum.rclone.org/)
-- ...and more
+- `api_url_address`（高级）
+  - 在线 API 地址，默认 `https://api.oplist.org/baiduyun/renewapi`。
 
-## Downloads
+- `upload_thread`（高级）
+  - 并发上传分片数量，范围 `1–64`，默认 `3`。
+  - 实际并发 = 此值；无需再额外加 Semaphore。
 
-- <https://rclone.org/downloads/>
+- `upload_timeout`（高级）
+  - 单个分片上传超时（秒）。超时会触发该分片重试。
 
-## License
+- `upload_api`（高级）
+  - 固定上传域名，默认 `https://d.pcs.baidu.com`。
+  - 当前实现优先使用该值，不主动调用 locateupload。
 
-This is free software under the terms of the MIT license (check the
-[COPYING file](/COPYING) included in this package).
+- `use_dynamic_upload_api`（高级）
+  - 预留开关，目前实现里实际由 `upload_api` 主导，动态域名逻辑未启用。
+
+- `custom_upload_part_size`（高级）
+  - 自定义分片大小（字节）。  
+  - 受会员等级限制：普通用户固定 4 MiB，VIP / SVIP 有更大上限。
+
+- `low_bandwith_upload_mode`（高级）
+  - 是否启用“低带宽模式”：从 4 MiB 开始逐步增大分片大小，保证总分片数 ≤ 2048。
+
+- `upload_retry_count`（高级）
+  - 每个分片的最大重试次数。默认 `10`。
+
+- `upload_retry_initial_wait` / `upload_retry_max_wait`（高级）
+  - 分片重试的初始退避时间 / 最大退避时间（默认为 1s / 5s）。
+  - 退避策略为指数退避，封顶于 `upload_retry_max_wait`。
+
+- `order_by` / `order_direction`（高级）
+  - 列目录排序字段：`name|time|size`，默认 `name`。
+  - 排序方向：`asc|desc`，默认 `asc`。
+
+> 说明：`access_token` 字段在配置中不需要手动填写。后端会在刷新 token 成功后将新 `access_token` 持久化回 `rclone.conf`。
+
+---
+
+## 上传原理
+
+### 1. 秒传（rapid upload）
+
+1. 打开输入流，将数据写入一个可随机访问的临时文件（必要时落盘）。  
+2. 根据文件大小和用户 VIP 等级，计算分片大小 `sliceSize`，保证总分片数 ≤ 2048。  
+3. 按 `sliceSize` 计算：
+   - 整体 `content-md5`；
+   - 前 256 KiB 的 `slice-md5`；
+   - 每个分片的 MD5 列表 `block_list`。
+4. 构造 `block_list = [content-md5]` 调用 `xpan/file?method=create`，尝试 rapid 上传：
+   - 命中则直接返回新对象（并修正 mtime 到源文件时间）。
+   - 未命中则进入分片上传流程。
+
+### 2. 分片上传（precreate + superfile2）
+
+1. 首次上传 / 无进度缓存：
+   - 调用 `xpan/file?method=precreate`：
+     - `path`, `size`, `isdir=0`, `autoinit=1`, `rtype=3`, `block_list`；
+     - 首次会附带 `content-md5`/`slice-md5` 以便服务器做秒传判定。
+   - 若 `ReturnType=2`，说明服务端已有相同内容，直接当作秒传成功。
+2. 如果 `ReturnType=1`：
+   - 记录 `uploadid` 和 `block_list`（分片序号列表）。
+   - 计算每个分片的 `(offset, size)`，并发调用 `pcs/superfile2?method=upload`。
+   - 每个分片：
+     - 使用 multipart/form-data 构造请求体，避免 chunked 传输；
+     - 单片内有 `upload_retry_count` 次重试，带指数退避，受 `upload_timeout` 控制。
+3. 断点续传：
+   - 进度会持久化到缓存目录：`~/.cache/rclone/baidunetdisk/<remoteName>/`。  
+   - key 为 `content-md5 + "_" + access_token`，内容是 `PrecreateResp`，包含 `uploadid` 和未完成的 `block_list`。
+   - 下次上传同一文件时，会先尝试加载该进度，只重传未完成的分片。
+4. `uploadid` 过期：
+   - 后端在分片响应中检测 uploadid 失效错误，返回内部 `errUploadIDExpired`。  
+   - 外层会重新 `precreate`（不再带 content/slice md5），丢弃旧进度，从头重新上传剩余分片。
+
+### 3. 最终合并（create）
+
+所有分片成功后，调用：
+
+- `xpan/file?method=create`：
+  - `path`, `size`, `isdir=0`, `rtype=3`, `uploadid`, `block_list`；
+  - 同时设置 `local_mtime/local_ctime`（虽然百度不会按原意返回这些时间）。
+
+返回的 File 信息中，百度的 `server_mtime` 仍然是当前时间；后端会在内存中将对象的 `modTime/ctime` 强制覆盖为源文件时间，以便当前命令内的日志/对象信息一致。但**下次 `list` 时，仍然只能拿到百度返回的时间，因此我们在同步判断上直接放弃使用 mtime**（见下一节）。
+
+---
+
+## 下载原理
+
+- 只使用官方 API：
+  - `xpan/multimedia?method=filemetas&fsids=[...]&dlink=1` 获取 `dlink`；
+  - 拼接 `dlink + access_token` 后先发 `HEAD` 请求，禁止自动跟随重定向；
+  - 从 `Location` 拿到真实下载 URL；
+  - 用 `GET` 下载，携带 `User-Agent: pan.baidu.com`。
+- 不实现 / 不迁移以下 OpenList 特性：
+  - 各种 crack / crack_video 等非官方下载接口；
+  - only_list_video_file 等特定业务行为。
+
+---
+
+## 一致性与校验策略
+
+百度网盘的 API 限制决定了这个后端在校验上只能做到：
+
+- **按文件名 + 文件大小判断是否一致**，不做真正的内容校验。
+
+具体实现：
+
+- `Hashes()` 返回 `hash.None`，`Object.Hash()` 始终返回 `hash.ErrUnsupported`：
+  - rclone 不会使用百度返回的 MD5 做传输后校验；
+  - 避免“上传成功但 MD5 不同 → 错误判为 corrupted on transfer”。
+- `Precision()` 返回 `fs.ModTimeNotSupported`：
+  - 向 rclone 声明：该后端不提供可靠的 mtime；
+  - 同步/复制时不会再用 mtime 参与判等，等价于自动启用“size-only”语义。
+
+这意味着：
+
+- 第二轮 `copy` / `sync` 不会因为 mtime 或 Baidu 的伪 MD5 而触发重复上传；
+- 如果你需要更强的校验，只能通过额外手段（例如在另一端生成校验和文件、自己比对），rclone 这里不会替你做严格验证。
+
+---
+
+## 高级 FS 操作
+
+`baidunetdisk` 后端实现了部分类似 OpenList 的服务器端操作：
+
+- `Copy` / `Move`：
+  - 使用 `xpan/file?method=filemanager&opera=copy|move`；
+  - 参数包括 `path`, `dest`, `newname`。
+
+- `DirMove`：
+  - 在同一远端内使用 `filemanager&opera=move` 将整个目录树移动到新位置。
+
+- `Purge`：
+  - 使用 `filemanager&opera=delete` 删除指定目录及其内容。
+
+这些操作的行为与 OpenList 中的百度网盘驱动保持一致，但同样受百度官方接口限制。
+
+---
+
+## 使用示例
+
+### 配置远端
+
+```bash
+rclone-bd config
+  name> baidu-main
+  Storage> baidunetdisk
+  # 按提示填写 refresh_token 等参数
+```
+
+### 基本复制
+
+```bash
+# 本地目录 -> 百度网盘目录
+rclone-bd copy 2025-11-28 baidu-main:test1 -P -vv
+```
+
+### 大文件上传建议
+
+- 为大文件（多 GB）场景调整：
+  - `upload_thread`：例如 32–64；
+  - `upload_timeout`：根据网络情况酌情提高；
+  - `upload_retry_count` + `upload_retry_max_wait`：适当增大，改善长链路稳定性。
+- 当遇到错误 `errno=-9 / errno=10` 时：
+  - `-9` 多为路径/空目录场景，后端已做兼容处理；
+  - `10` 通常是百度认为分片状态/参数有问题，本分支已经按 OpenList 的逻辑做了对齐，如果仍遇到，建议降低并发或重试。
+
+---
+
+## 差异小结（相对于官方 rclone）
+
+- 多了一个 **实验性** 后端：`baidunetdisk`，专门用于百度网盘。
+- 上传逻辑 1:1 参考 OpenList / alist 魔改版：
+  - 优先秒传；
+  - 分片上传 + 断点续传 + uploadid 过期重试；
+  - 可调的并发、分片大小和重试策略。
+- 故意关闭：
+  - Baidu MD5 的校验使用（只展示、不参与一致性判断）；
+  - mtime 用于 sync 判等（Precision=ModTimeNotSupported）。
+
+如果你只关心“文件名 + 大小一致即可”，这个后端已经可以投入日常使用；  
+如果需要严格比对内容完整性，则需要在 rclone 之外额外设计校验策略。
