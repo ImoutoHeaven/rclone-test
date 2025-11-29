@@ -432,6 +432,11 @@ func (f *Fs) put(ctx context.Context, in io.Reader, src fs.ObjectInfo, _ []fs.Op
 	}
 	fs.Debugf(f, "create ok path=%s fsid=%d size=%d", full, fileInfo.FsID, fileInfo.Size)
 	info := fileInfo.toObjectInfo(f.root)
+	// Baidu's create API returns \"now\" as mtime even when local_mtime is
+	// set; mirror OpenList by overriding the returned timestamps so rclone's
+	// change detection doesn't treat freshly uploaded files as changed.
+	info.modTime = modTime
+	info.ctime = modTime
 	return f.newObject(info), nil
 }
 
