@@ -169,6 +169,15 @@ jobs:
         run: |
           rclone version
 
+      - name: Upload rclone binary artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: rclone-${{ matrix.job_name }}
+          path: |
+            rclone
+            rclone.exe
+          if-no-files-found: ignore
+
       - name: Run tests
         run: |
           make quicktest
