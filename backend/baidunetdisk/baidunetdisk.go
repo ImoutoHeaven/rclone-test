@@ -864,7 +864,9 @@ func (o *Object) resolveDownloadLocation(ctx context.Context, dlink string) (str
 	if err != nil {
 		return "", err
 	}
-	defer resp.Body.Close()
+	defer func() {
+		_ = resp.Body.Close()
+	}()
 	if resp.StatusCode >= http.StatusBadRequest {
 		return "", parseBaiduDownloadError(resp)
 	}
@@ -888,7 +890,9 @@ func (o *Object) doDownload(ctx context.Context, location string, headers map[st
 		return nil, err
 	}
 	if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices {
-		defer resp.Body.Close()
+		defer func() {
+			_ = resp.Body.Close()
+		}()
 		return nil, parseBaiduDownloadError(resp)
 	}
 	return resp.Body, nil
