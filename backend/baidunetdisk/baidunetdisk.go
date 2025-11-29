@@ -89,16 +89,16 @@ func NewFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, e
 		return nil, err
 	}
 	f.vipType = vip
+	f.features = (&fs.Features{
+		CaseInsensitive:         false,
+		CanHaveEmptyDirectories: true,
+	}).Fill(ctx, f)
 	if err := f.adjustRoot(ctx); err != nil {
 		if errors.Is(err, fs.ErrorIsFile) {
 			return f, fs.ErrorIsFile
 		}
 		return nil, err
 	}
-	f.features = (&fs.Features{
-		CaseInsensitive:         false,
-		CanHaveEmptyDirectories: true,
-	}).Fill(ctx, f)
 	return f, nil
 }
 
