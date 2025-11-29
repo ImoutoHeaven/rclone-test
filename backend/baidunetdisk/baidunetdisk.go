@@ -116,7 +116,10 @@ func (f *Fs) String() string { return fmt.Sprintf("Baidu Netdisk root '%s'", f.r
 func (f *Fs) Precision() time.Duration { return time.Second }
 
 // Hashes returns supported hash types.
-func (f *Fs) Hashes() hash.Set { return hash.Set(hash.MD5) }
+// Baidu's reported MD5 for superfile2 uploads is not a reliable end-to-end
+// checksum (see OpenList notes), so we deliberately disable hash support to
+// avoid false "corrupted on transfer" results.
+func (f *Fs) Hashes() hash.Set { return hash.Set(hash.None) }
 
 // Features returns optional features.
 func (f *Fs) Features() *fs.Features { return f.features }
@@ -713,11 +716,8 @@ func (o *Object) Remote() string { return o.remote }
 // String representation.
 func (o *Object) String() string { return o.Remote() }
 
-// Hash returns md5 when requested.
+// Hash is not supported because Baidu's MD5 is not an authoritative checksum.
 func (o *Object) Hash(ctx context.Context, t hash.Type) (string, error) {
-	if t == hash.MD5 {
-		return o.info.md5, nil
-	}
 	return "", hash.ErrUnsupported
 }
 
