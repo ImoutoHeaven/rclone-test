@@ -2,6 +2,7 @@
 package baidunetdisk
 
 import (
+	"bytes"
 	"context"
 	"crypto/md5"
 	"encoding/hex"
@@ -507,26 +508,24 @@ func (f *Fs) uploadParts(ctx context.Context, pre *PrecreateResp, file *os.File,
 
 // uploadSlice performs single slice upload.
 func (f *Fs) uploadSlice(ctx context.Context, uploadURL, fullPath, uploadID, fileName string, partSeq int, file *os.File, offset, size int64) error {
-	pr, pw := io.Pipe()
-	mw := multipart.NewWriter(pw)
-	go func() {
-		defer func() {
-			_ = pw.Close()
-		}()
-		part, err := mw.CreateFormFile("file", fileName)
-		if err != nil {
-			_ = pw.CloseWithError(err)
-			return
-		}
-		section := io.NewSectionReader(file, offset, size)
-		if _, err := io.Copy(part, section); err != nil {
-			_ = pw.CloseWithError(err)
-			return
-		}
-		_ = mw.Close()
-	}()
+	// Build multipart head/tail to avoid chunked transfer (Baidu rejects chunked).
+	var buf bytes.Buffer
+	mw := multipart.NewWriter(&buf)
+	_, err := mw.CreateFormFile("file", fileName)
+	if err != nil {
+		return err
+	}
+	headLen := buf.Len()
+	if err := mw.Close(); err != nil {
+		return err
+	}
+	bufBytes := buf.Bytes()
+	head := bytes.NewReader(bufBytes[:headLen])
+	tail := bytes.NewReader(bufBytes[headLen:])
+	section := io.NewSectionReader(file, offset, size)
+	body := io.MultiReader(head, section, tail)
 
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, uploadURL+"/rest/2.0/pcs/superfile2", pr)
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, uploadURL+"/rest/2.0/pcs/superfile2", body)
 	if err != nil {
 		return err
 	}
@@ -539,6 +538,7 @@ func (f *Fs) uploadSlice(ctx context.Context, uploadURL, fullPath, uploadID, fil
 	q.Set("access_token", f.accessToken)
 	req.URL.RawQuery = q.Encode()
 	req.Header.Set("Content-Type", mw.FormDataContentType())
+	req.ContentLength = int64(head.Len()) + size + int64(tail.Len())
 	client := *f.client
 	if f.opt.UploadTimeout > 0 {
 		client.Timeout = f.opt.UploadTimeout
@@ -552,11 +552,11 @@ func (f *Fs) uploadSlice(ctx context.Context, uploadURL, fullPath, uploadID, fil
 	defer func() {
 		_ = resp.Body.Close()
 	}()
-	body, err := io.ReadAll(resp.Body)
+	respBody, err := io.ReadAll(resp.Body)
 	if err != nil {
 		return err
 	}
-	lower := strings.ToLower(string(body))
+	lower := strings.ToLower(string(respBody))
 	if strings.Contains(lower, "uploadid") &&
 		(strings.Contains(lower, "invalid") || strings.Contains(lower, "expired") || strings.Contains(lower, "not found")) {
 		return errUploadIDExpired
@@ -565,9 +565,9 @@ func (f *Fs) uploadSlice(ctx context.Context, uploadURL, fullPath, uploadID, fil
 		Errno     int `json:"errno"`
 		ErrorCode int `json:"error_code"`
 	}
-	_ = json.Unmarshal(body, &errno)
+	_ = json.Unmarshal(respBody, &errno)
 	if errno.Errno != 0 || errno.ErrorCode != 0 {
-		return fmt.Errorf("upload slice failed: errno=%d code=%d resp=%s", errno.Errno, errno.ErrorCode, string(body))
+		return fmt.Errorf("upload slice failed: errno=%d code=%d resp=%s", errno.Errno, errno.ErrorCode, string(respBody))
 	}
 	return nil
 }
