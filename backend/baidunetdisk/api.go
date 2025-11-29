@@ -52,7 +52,7 @@ type Options struct {
 	UploadAPI              string        `config:"upload_api"`
 	UseDynamicUploadAPI    bool          `config:"use_dynamic_upload_api"`
 	CustomUploadPartSize   int64         `config:"custom_upload_part_size"`
-	LowBandwidthUploadMode bool          `config:"low_bandwith_upload_mode"`
+	LowBandwidthUploadMode bool          `config:"low_bandwith_upload_mode"` //nolint:misspell // keep tag aligned with upstream naming
 	UploadRetryCount       int           `config:"upload_retry_count"`
 	UploadRetryWait        time.Duration `config:"upload_retry_initial_wait"`
 	UploadRetryMaxWait     time.Duration `config:"upload_retry_max_wait"`
@@ -156,7 +156,7 @@ var configOptions = []fs.Option{{
 	Default:  int64(0),
 	Advanced: true,
 }, {
-	Name:     "low_bandwith_upload_mode",
+	Name:     "low_bandwith_upload_mode", //nolint:misspell // keep option name for compatibility
 	Help:     "Enable low bandwidth mode (increase slice size gradually to keep part count <= 2048).",
 	Default:  false,
 	Advanced: true,
