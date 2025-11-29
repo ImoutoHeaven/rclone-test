@@ -287,8 +287,12 @@ func (f *Fs) refreshTokenOnce(ctx context.Context) error {
 		}
 		f.accessToken = out.AccessToken
 		f.opt.RefreshToken = out.RefreshToken
-		config.FileSetValue(f.name, "refresh_token", f.opt.RefreshToken)
-		config.FileSetValue(f.name, "access_token", f.accessToken)
+		if err := config.SetValueAndSave(f.name, "refresh_token", f.opt.RefreshToken); err != nil {
+			return err
+		}
+		if err := config.SetValueAndSave(f.name, "access_token", f.accessToken); err != nil {
+			return err
+		}
 		return nil
 	}
 
@@ -330,8 +334,12 @@ func (f *Fs) refreshTokenOnce(ctx context.Context) error {
 	}
 	f.accessToken = token.AccessToken
 	f.opt.RefreshToken = token.RefreshToken
-	config.FileSetValue(f.name, "refresh_token", f.opt.RefreshToken)
-	config.FileSetValue(f.name, "access_token", f.accessToken)
+	if err := config.SetValueAndSave(f.name, "refresh_token", f.opt.RefreshToken); err != nil {
+		return err
+	}
+	if err := config.SetValueAndSave(f.name, "access_token", f.accessToken); err != nil {
+		return err
+	}
 	return nil
 }
 
