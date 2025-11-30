@@ -10,6 +10,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math/rand"
 	"mime/multipart"
 	"net/http"
 	"net/url"
@@ -39,6 +40,8 @@ type Fs struct {
 	tokenMu     sync.Mutex
 
 	progressStore *uploadProgressStore
+	uploadHostsMu sync.Mutex
+	uploadHosts   map[string][]string
 }
 
 // Object represents a Baidu Netdisk object.
@@ -91,6 +94,7 @@ func NewFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, e
 		opt:           opt,
 		client:        newHTTPClient(ctx),
 		progressStore: newUploadProgressStore(name),
+		uploadHosts:   make(map[string][]string),
 	}
 	if err := f.ensureAccessToken(ctx); err != nil {
 		return nil, err
@@ -405,7 +409,7 @@ func (f *Fs) put(ctx context.Context, in io.Reader, src fs.ObjectInfo, _ []fs.Op
 		fs.Debugf(f, "resume upload from cache path=%s uploadid=%s pending=%d", full, precreate.UploadID, countPending(precreate.BlockList))
 	}
 	if precreate.UploadURL == "" {
-		precreate.UploadURL = f.getUploadURL(full, precreate.UploadID)
+		precreate.UploadURL = f.getUploadURL(ctx, full, precreate.UploadID)
 	}
 
 	for retry := 0; retry < 2; retry++ {
@@ -428,7 +432,7 @@ func (f *Fs) put(ctx context.Context, in io.Reader, src fs.ObjectInfo, _ []fs.Op
 				return f.newObject(info), nil
 			}
 			precreate = newPre
-			precreate.UploadURL = f.getUploadURL(full, precreate.UploadID)
+			precreate.UploadURL = f.getUploadURL(ctx, full, precreate.UploadID)
 			continue
 		}
 		fs.Debugf(f, "upload parts failed path=%s uploadid=%s err=%v", full, precreate.UploadID, err)
@@ -481,6 +485,9 @@ func (f *Fs) uploadParts(ctx context.Context, pre *PrecreateResp, file *os.File,
 		lastBlockSize = sliceSize
 	}
 
+	// Resolve initial upload URL (may be static or dynamic based on config).
+	uploadURL := pre.UploadURL
+
 	sem := make(chan struct{}, f.opt.UploadThread)
 	var mu sync.Mutex
 	g, ctx := errgroup.WithContext(ctx)
@@ -490,6 +497,38 @@ func (f *Fs) uploadParts(ctx context.Context, pre *PrecreateResp, file *os.File,
 		}
 		idx := idx
 		partSeq := seq
+
+		// When dynamic upload api is enabled, optionally rotate upload domain every N parts
+		// to avoid being stuck on a bad upload host.
+		host := uploadURL
+		if f.opt.UseDynamicUploadAPI {
+			rotate := f.opt.DynamicUploadAPIRotate
+			if rotate <= 0 {
+				rotate = 0
+			}
+			// Resolve initial host if still empty
+			if host == "" {
+				host = f.getUploadURL(ctx, fullPath, pre.UploadID)
+				uploadURL = host
+				if host != "" {
+					fs.Debugf(f, "dynamic upload api initial host=%s path=%s uploadid=%s", host, fullPath, pre.UploadID)
+				}
+			} else if rotate > 0 && partSeq != 0 && partSeq%rotate == 0 {
+				// Every rotate parts, refresh upload host for subsequent slices
+				newHost := f.getUploadURL(ctx, fullPath, pre.UploadID)
+				if newHost != "" {
+					fs.Debugf(f, "dynamic upload api rotate host old=%s new=%s path=%s uploadid=%s part=%d", host, newHost, fullPath, pre.UploadID, partSeq)
+					host = newHost
+					uploadURL = newHost
+				}
+			}
+		}
+		if host == "" {
+			// Fallback to configured upload api when dynamic resolution is disabled or failed.
+			host = f.opt.UploadAPI
+			uploadURL = host
+		}
+
 		sem <- struct{}{}
 		g.Go(func() error {
 			defer func() { <-sem }()
@@ -504,7 +543,17 @@ func (f *Fs) uploadParts(ctx context.Context, pre *PrecreateResp, file *os.File,
 				if ctx.Err() != nil {
 					return ctx.Err()
 				}
-				attemptErr = f.uploadSlice(ctx, pre.UploadURL, fullPath, pre.UploadID, fileName, partSeq, file, offset, partSize)
+				currentHost := host
+				// When slice-level random is enabled, pick a host per attempt from cached https servers list.
+				if f.opt.UseDynamicUploadAPI && f.opt.DynamicUploadAPISliceRandom {
+					f.uploadHostsMu.Lock()
+					hosts := f.uploadHosts[pre.UploadID]
+					f.uploadHostsMu.Unlock()
+					if len(hosts) > 0 {
+						currentHost = hosts[rand.Intn(len(hosts))]
+					}
+				}
+				attemptErr = f.uploadSlice(ctx, currentHost, fullPath, pre.UploadID, fileName, partSeq, file, offset, partSize)
 				if attemptErr == nil {
 					mu.Lock()
 					pre.BlockList[idx] = -1
@@ -569,6 +618,7 @@ func (f *Fs) uploadSlice(ctx context.Context, uploadURL, fullPath, uploadID, fil
 	}
 	resp, err := client.Do(req)
 	if err != nil {
+		fs.Debugf(f, "upload slice request error host=%s path=%s uploadid=%s part=%d err=%v", uploadURL, fullPath, uploadID, partSeq, err)
 		return err
 	}
 	defer func() {
@@ -576,6 +626,7 @@ func (f *Fs) uploadSlice(ctx context.Context, uploadURL, fullPath, uploadID, fil
 	}()
 	respBody, err := io.ReadAll(resp.Body)
 	if err != nil {
+		fs.Debugf(f, "upload slice read error host=%s path=%s uploadid=%s part=%d err=%v", uploadURL, fullPath, uploadID, partSeq, err)
 		return err
 	}
 	lower := strings.ToLower(string(respBody))
@@ -589,6 +640,7 @@ func (f *Fs) uploadSlice(ctx context.Context, uploadURL, fullPath, uploadID, fil
 	}
 	_ = json.Unmarshal(respBody, &errno)
 	if errno.Errno != 0 || errno.ErrorCode != 0 {
+		fs.Debugf(f, "upload slice failed host=%s path=%s uploadid=%s part=%d errno=%d code=%d", uploadURL, fullPath, uploadID, partSeq, errno.Errno, errno.ErrorCode)
 		return fmt.Errorf("upload slice failed: errno=%d code=%d resp=%s", errno.Errno, errno.ErrorCode, string(respBody))
 	}
 	return nil

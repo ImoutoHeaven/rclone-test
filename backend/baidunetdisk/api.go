@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math/rand"
 	"net/http"
 	"net/url"
 	"os"
@@ -34,6 +35,8 @@ const (
 	maxUploadThread               = 64
 	minUploadThread               = 1
 	maxSliceNum                   = 2048
+	defaultDynamicUploadRotate    = 256
+	defaultDynamicUploadRandom    = false
 	defaultSliceSize        int64 = 4 * 1024 * 1024
 	vipSliceSize            int64 = 16 * 1024 * 1024
 	svipSliceSize           int64 = 32 * 1024 * 1024
@@ -60,6 +63,9 @@ type Options struct {
 	UploadTimeout          time.Duration `config:"upload_timeout"`
 	UploadAPI              string        `config:"upload_api"`
 	UseDynamicUploadAPI    bool          `config:"use_dynamic_upload_api"`
+	DynamicUploadAPIRotate int           `config:"dynamic_upload_api_rotate"`
+	DynamicUploadAPIRandom bool          `config:"dynamic_upload_api_random_pick"`
+	DynamicUploadAPISliceRandom bool     `config:"dynamic_upload_api_slice_random_pick"`
 	CustomUploadPartSize   int64         `config:"custom_upload_part_size"`
 	LowBandwidthUploadMode bool          `config:"low_bandwith_upload_mode"` //nolint:misspell // keep tag aligned with upstream naming
 	UploadRetryCount       int           `config:"upload_retry_count"`
@@ -156,7 +162,22 @@ var configOptions = []fs.Option{{
 	Advanced: true,
 }, {
 	Name:     "use_dynamic_upload_api",
-	Help:     "Whether to use locateupload to resolve upload domain (currently ignored; fixed upload_api takes precedence).",
+	Help:     "Use locateupload to resolve upload domain dynamically; falls back to upload_api on failure.",
+	Default:  true,
+	Advanced: true,
+}, {
+	Name:     "dynamic_upload_api_rotate",
+	Help:     "When dynamic upload api is enabled, re-resolve upload domain every N parts (0 to disable rotation).",
+	Default:  defaultDynamicUploadRotate,
+	Advanced: true,
+}, {
+	Name:     "dynamic_upload_api_random_pick",
+	Help:     "When dynamic upload api is enabled, randomly pick from https servers list instead of always using the first one.",
+	Default:  defaultDynamicUploadRandom,
+	Advanced: true,
+}, {
+	Name:     "dynamic_upload_api_slice_random_pick",
+	Help:     "When dynamic upload api is enabled, randomly pick upload host for each slice and retry using cached https servers.",
 	Default:  false,
 	Advanced: true,
 }, {
@@ -215,6 +236,14 @@ func (o *Options) setDefaults() {
 	}
 	if o.APIAddress == "" {
 		o.APIAddress = defaultOnlineAPIAddress
+	}
+	if o.DynamicUploadAPIRotate < 0 {
+		o.DynamicUploadAPIRotate = 0
+	}
+	if !o.UseDynamicUploadAPI {
+		// When dynamic upload api is disabled, random/rotate flags are ignored.
+		o.DynamicUploadAPIRandom = false
+		o.DynamicUploadAPISliceRandom = false
 	}
 	if o.UploadRetryCount == 0 {
 		o.UploadRetryCount = defaultRetryCount
@@ -528,11 +557,43 @@ func (f *Fs) apiCreate(ctx context.Context, fullPath string, size int64, isDir i
 	if blockList != "" {
 		form.Set("block_list", blockList)
 	}
+
 	var resp File
-	if _, err := f.apiPostForm(ctx, "/xpan/file", params, form, &resp); err != nil {
-		return nil, err
+	// 针对 errno=10（百度侧分片校验/时序问题）做有限次退避重试：
+	// 间隔 30s 和 60s，共 3 次尝试。
+	delays := []time.Duration{30 * time.Second, 60 * time.Second}
+	maxAttempts := len(delays) + 1
+
+	for attempt := 0; attempt < maxAttempts; attempt++ {
+		_, err := f.apiPostForm(ctx, "/xpan/file", params, form, &resp)
+		if err == nil {
+			return &resp, nil
+		}
+
+		var ee errnoError
+		if !errors.As(err, &ee) || ee.code != 10 {
+			// 非 errno=10 的错误不在这里重试，直接返回
+			return nil, err
+		}
+
+		// errno=10 视为可能的服务端时序问题，做有限次延迟重试
+		if attempt >= len(delays) {
+			// 已达到最大重试次数，仍然 errno=10
+			return nil, err
+		}
+
+		wait := delays[attempt]
+		fs.Debugf(f, "create errno=10, retrying in %v (attempt %d/%d) path=%s size=%d", wait, attempt+1, maxAttempts, fullPath, size)
+
+		// 等待时尊重 context 取消
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-time.After(wait):
+		}
 	}
-	return &resp, nil
+
+	return nil, errnoError{code: 10}
 }
 
 // apiPrecreate wraps precreate call. content/slice md5 included only when provided.
@@ -565,9 +626,112 @@ func (f *Fs) apiPrecreate(ctx context.Context, fullPath string, size int64, bloc
 	return &resp, nil
 }
 
-// getUploadURL returns configured upload api.
-func (f *Fs) getUploadURL(_ string, _ string) string {
-	return f.opt.UploadAPI
+// getUploadURL resolves upload api endpoint, optionally using locateupload.
+func (f *Fs) getUploadURL(ctx context.Context, fullPath, uploadID string) string {
+	// Dynamic resolution disabled: always use configured upload api.
+	if !f.opt.UseDynamicUploadAPI || fullPath == "" || uploadID == "" {
+		return f.opt.UploadAPI
+	}
+	u, err := f.locateUpload(ctx, fullPath, uploadID)
+	if err != nil {
+		fs.Debugf(f, "locateupload failed for path=%s uploadid=%s: %v, fallback to %s", fullPath, uploadID, err, f.opt.UploadAPI)
+		return f.opt.UploadAPI
+	}
+	return u
+}
+
+// locateUpload calls Baidu locateupload api to obtain preferred upload domain.
+func (f *Fs) locateUpload(ctx context.Context, fullPath, uploadID string) (string, error) {
+	base := defaultUploadAPI
+	u, err := url.Parse(base + "/rest/2.0/pcs/file")
+	if err != nil {
+		return "", err
+	}
+	q := u.Query()
+	q.Set("method", "locateupload")
+	q.Set("appid", "250528")
+	q.Set("path", fullPath)
+	q.Set("uploadid", uploadID)
+	q.Set("upload_version", "2.0")
+	u.RawQuery = q.Encode()
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u.String(), nil)
+	if err != nil {
+		return "", err
+	}
+
+	resp, err := f.client.Do(req)
+	if err != nil {
+		return "", err
+	}
+	defer func() {
+		_ = resp.Body.Close()
+	}()
+	if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices {
+		data, _ := io.ReadAll(io.LimitReader(resp.Body, maxDownloadErrorBody))
+		return "", fmt.Errorf("locateupload status=%d body=%s", resp.StatusCode, strings.TrimSpace(string(data)))
+	}
+
+	var payload UploadServerResp
+	if err := json.NewDecoder(resp.Body).Decode(&payload); err != nil {
+		return "", err
+	}
+	if payload.ErrorCode != 0 {
+		return "", fmt.Errorf("locateupload error_code=%d msg=%s", payload.ErrorCode, payload.ErrorMsg)
+	}
+
+	// Prefer https servers; optionally random pick when enabled.
+	pickRandom := f.opt.DynamicUploadAPIRandom
+
+	httpsFromList := func(list []struct{ Server string `json:"server"` }) []string {
+		out := make([]string, 0, len(list))
+		for _, s := range list {
+			if strings.HasPrefix(s.Server, "https://") {
+				out = append(out, s.Server)
+			}
+		}
+		return out
+	}
+
+	serversHTTPS := httpsFromList(payload.Servers)
+	if len(serversHTTPS) > 0 {
+		host := serversHTTPS[0]
+		if pickRandom && len(serversHTTPS) > 1 {
+			idx := rand.Intn(len(serversHTTPS))
+			host = serversHTTPS[idx]
+		}
+		fs.Debugf(f, "locateupload resolved server=%s path=%s uploadid=%s random=%v candidates=%d", host, fullPath, uploadID, pickRandom, len(serversHTTPS))
+		return host, nil
+	}
+
+	bakHTTPS := httpsFromList(payload.BakServers)
+	if len(bakHTTPS) > 0 {
+		host := bakHTTPS[0]
+		if pickRandom && len(bakHTTPS) > 1 {
+			idx := rand.Intn(len(bakHTTPS))
+			host = bakHTTPS[idx]
+		}
+		fs.Debugf(f, "locateupload resolved bak_server=%s path=%s uploadid=%s random=%v candidates=%d", host, fullPath, uploadID, pickRandom, len(bakHTTPS))
+		return host, nil
+	}
+
+	// Cache https hosts list for per-slice random pick.
+	allHTTPS := append(serversHTTPS, bakHTTPS...)
+	if len(allHTTPS) > 0 {
+		f.uploadHostsMu.Lock()
+		f.uploadHosts[uploadID] = allHTTPS
+		f.uploadHostsMu.Unlock()
+	}
+
+	if payload.Host != "" {
+		host := payload.Host
+		if !strings.HasPrefix(host, "http://") && !strings.HasPrefix(host, "https://") {
+			host = "https://" + host
+		}
+		fs.Debugf(f, "locateupload resolved host=%s path=%s uploadid=%s", host, fullPath, uploadID)
+		return host, nil
+	}
+	return "", fmt.Errorf("locateupload: no upload server in response for path=%s uploadid=%s", fullPath, uploadID)
 }
 
 // ensureAccessToken ensures we have an access token.

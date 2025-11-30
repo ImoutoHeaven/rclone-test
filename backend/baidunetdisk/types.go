@@ -74,6 +74,31 @@ type QuotaResp struct {
 	Used  uint64 `json:"used"`
 }
 
+// UploadServerResp represents locateupload response payload.
+type UploadServerResp struct {
+	BakServer  []any `json:"bak_server"`
+	BakServers []struct {
+		Server string `json:"server"`
+	} `json:"bak_servers"`
+	ClientIP    string `json:"client_ip"`
+	ErrorCode   int    `json:"error_code"`
+	ErrorMsg    string `json:"error_msg"`
+	Expire      int    `json:"expire"`
+	Host        string `json:"host"`
+	Newno       string `json:"newno"`
+	QuicServer  []any  `json:"quic_server"`
+	QuicServers []struct {
+		Server string `json:"server"`
+	} `json:"quic_servers"`
+	RequestID  int64 `json:"request_id"`
+	Server     []any `json:"server"`
+	ServerTime int   `json:"server_time"`
+	Servers    []struct {
+		Server string `json:"server"`
+	} `json:"servers"`
+	Sl int `json:"sl"`
+}
+
 func (f File) ensureTimes() File {
 	if f.ServerCtime == 0 {
 		f.ServerCtime = f.Ctime

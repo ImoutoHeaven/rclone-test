@@ -65,10 +65,21 @@ rclone-bd config
 
 - `upload_api`（高级）
   - 固定上传域名，默认 `https://d.pcs.baidu.com`。
-  - 当前实现优先使用该值，不主动调用 locateupload。
+  - 当未启用动态上传域名或 `locateupload` 调用失败时，会回退使用该值。
 
-- `use_dynamic_upload_api`（高级）
-  - 预留开关，目前实现里实际由 `upload_api` 主导，动态域名逻辑未启用。
+- `use_dynamic_upload_api` / `dynamic_upload_api_rotate`（高级）
+  - `use_dynamic_upload_api=true` 时，会调用官方 `locateupload` 接口为每个上传会话解析推荐的上传域名。
+  - `dynamic_upload_api_rotate` 控制分片上传过程中多久重新解析一次上传域名（默认 `256`，单位：分片序号；设为 `0` 可禁用轮换，仅首次解析一次）。
+
+- `dynamic_upload_api_random_pick`（高级）
+  - 配合 `use_dynamic_upload_api=true` 使用。
+  - 为 `true` 时，从 `locateupload` 返回的 https `servers` 列表中随机选择一个上传域名；若该列表为空，则从 `bak_servers` 的 https 域名中随机选择。
+  - 为 `false`（默认）时，始终选择 https servers 列表中的第一个（若有），行为更稳定可预测。
+
+- `dynamic_upload_api_slice_random_pick`（高级）
+  - 配合 `use_dynamic_upload_api=true` 使用。
+  - 为 `true` 时，会在每个分片上传和重试时，从最近一次 `locateupload` 缓存的 https 域名列表中随机选择上传主机；多个分片会均匀打散到不同 host 上。
+  - 为 `false`（默认）时，同一轮 locate 解析出的 host 会在该分片的所有重试中保持不变，仅在 `dynamic_upload_api_rotate` 触发时才更换主机。
 
 - `custom_upload_part_size`（高级）
   - 自定义分片大小（字节）。  
