@@ -1277,6 +1277,12 @@ type localOpenFile struct {
 	fd   *os.File          // file object reference
 }
 
+// UnderlyingFile returns the underlying *os.File so downstream
+// backends can optionally take advantage of random access.
+func (file *localOpenFile) UnderlyingFile() *os.File {
+	return file.fd
+}
+
 // Read bytes from the object - see io.Reader
 func (file *localOpenFile) Read(p []byte) (n int, err error) {
 	if !file.o.fs.opt.NoCheckUpdated {
@@ -1316,6 +1322,27 @@ func (file *localOpenFile) Close() (err error) {
 		}
 	}
 	return err
+}
+
+// localReadCloserWithFile wraps a ReadCloser and exposes the
+// underlying *os.File without adding hashing logic.
+type localReadCloserWithFile struct {
+	rc io.ReadCloser
+	fd *os.File
+}
+
+func (r *localReadCloserWithFile) Read(p []byte) (int, error) {
+	return r.rc.Read(p)
+}
+
+func (r *localReadCloserWithFile) Close() error {
+	return r.rc.Close()
+}
+
+// UnderlyingFile returns the underlying *os.File so downstream
+// backends can optionally take advantage of random access.
+func (r *localReadCloserWithFile) UnderlyingFile() *os.File {
+	return r.fd
 }
 
 // Returns a ReadCloser() object that contains the contents of a symbolic link
@@ -1382,8 +1409,8 @@ func (o *Object) Open(ctx context.Context, options ...fs.OpenOption) (in io.Read
 		return wrappedFd, err
 	}
 	if hasher == nil {
-		// no need to wrap since we don't need checksums
-		return wrappedFd, nil
+		// no need to wrap with hashing, but expose the underlying file
+		return &localReadCloserWithFile{rc: wrappedFd, fd: fd}, nil
 	}
 	// Update the hashes as we go along
 	in = &localOpenFile{

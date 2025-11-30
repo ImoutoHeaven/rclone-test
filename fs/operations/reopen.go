@@ -4,10 +4,12 @@ import (
 	"context"
 	"errors"
 	"io"
+	"os"
 	"sync"
 
 	"github.com/rclone/rclone/fs"
 	"github.com/rclone/rclone/fs/fserrors"
+	"github.com/rclone/rclone/lib/readers"
 )
 
 // AccountFn is a function which will be called after every read
@@ -38,6 +40,22 @@ type ReOpen struct {
 	account     AccountFn       // account for a read
 	reads       int             // count how many times the data has been read
 	accountOn   int             // only account on or after this read
+}
+
+// UnderlyingFile returns the underlying *os.File if the wrapped
+// reader exposes it, otherwise nil. This allows downstream backends
+// to optionally take advantage of random access on local files when
+// the source Fs supports it.
+func (h *ReOpen) UnderlyingFile() *os.File {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if h.rc == nil {
+		return nil
+	}
+	if uf, ok := h.rc.(readers.UnderlyingFile); ok {
+		return uf.UnderlyingFile()
+	}
+	return nil
 }
 
 var (

@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"os"
 	"sync"
 	"time"
 	"unicode/utf8"
@@ -15,6 +16,7 @@ import (
 	"github.com/rclone/rclone/fs"
 	"github.com/rclone/rclone/fs/asyncreader"
 	"github.com/rclone/rclone/fs/fserrors"
+	"github.com/rclone/rclone/lib/readers"
 )
 
 // ErrorMaxTransferLimitReached defines error when transfer limit is reached.
@@ -73,6 +75,19 @@ type Account struct {
 	tokenBucket buckets // per file bandwidth limiter (may be nil)
 
 	values accountValues
+}
+
+// UnderlyingFile returns the underlying *os.File if the wrapped
+// reader exposes it, otherwise nil. This allows downstream backends
+// to optionally take advantage of random access on local files.
+func (a *Account) UnderlyingFile() *os.File {
+	if a == nil || a.origIn == nil {
+		return nil
+	}
+	if uf, ok := a.origIn.(readers.UnderlyingFile); ok {
+		return uf.UnderlyingFile()
+	}
+	return nil
 }
 
 // accountValues holds statistics for this Account

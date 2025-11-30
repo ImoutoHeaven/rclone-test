@@ -26,6 +26,7 @@ import (
 	"github.com/rclone/rclone/fs"
 	"github.com/rclone/rclone/fs/config/configmap"
 	"github.com/rclone/rclone/fs/hash"
+	"github.com/rclone/rclone/lib/readers"
 )
 
 // Fs represents Baidu Netdisk backend.
@@ -371,7 +372,7 @@ func (f *Fs) put(ctx context.Context, in io.Reader, src fs.ObjectInfo, _ []fs.Op
 	size := src.Size()
 	modTime := src.ModTime(ctx)
 	fs.Debugf(f, "upload start path=%s size=%d", full, size)
-	cacheFile, cleanup, err := f.ensureCacheFile(ctx, in, size)
+	cacheFile, cleanup, err := f.ensureCacheFile(ctx, in, size, full)
 	if err != nil {
 		return nil, err
 	}
@@ -518,6 +519,8 @@ func (f *Fs) uploadParts(ctx context.Context, pre *PrecreateResp, file *os.File,
 
 	sem := make(chan struct{}, f.opt.UploadThread)
 	var mu sync.Mutex
+	hostHits := make(map[string]int)
+	var hostHitsMu sync.Mutex
 	g, ctx := errgroup.WithContext(ctx)
 	for idx, seq := range pre.BlockList {
 		if seq < 0 {
@@ -586,6 +589,11 @@ func (f *Fs) uploadParts(ctx context.Context, pre *PrecreateResp, file *os.File,
 					mu.Lock()
 					pre.BlockList[idx] = -1
 					mu.Unlock()
+					if f.opt.UseDynamicUploadAPI && f.opt.DynamicUploadAPISliceRandom && currentHost != "" {
+						hostHitsMu.Lock()
+						hostHits[currentHost]++
+						hostHitsMu.Unlock()
+					}
 					return nil
 				}
 				if errors.Is(attemptErr, errUploadIDExpired) {
@@ -602,7 +610,15 @@ func (f *Fs) uploadParts(ctx context.Context, pre *PrecreateResp, file *os.File,
 			return attemptErr
 		})
 	}
-	return g.Wait()
+	err := g.Wait()
+	if err == nil && f.opt.UseDynamicUploadAPI && f.opt.DynamicUploadAPISliceRandom {
+		hostHitsMu.Lock()
+		if len(hostHits) > 0 {
+			fs.Debugf(f, "dynamic upload api slice random host distribution path=%s uploadid=%s hosts=%d detail=%v", fullPath, pre.UploadID, len(hostHits), hostHits)
+		}
+		hostHitsMu.Unlock()
+	}
+	return err
 }
 
 // uploadSlice performs single slice upload.
@@ -767,13 +783,25 @@ func (f *Fs) clearServerBlockList(uploadID string) {
 }
 
 // ensureCacheFile ensures we have a seekable file for upload.
-func (f *Fs) ensureCacheFile(ctx context.Context, in io.Reader, size int64) (*os.File, bool, error) {
+func (f *Fs) ensureCacheFile(ctx context.Context, in io.Reader, size int64, fullPath string) (*os.File, bool, error) {
+	fs.Debugf(f, "ensureCacheFile input reader type=%T path=%s size=%d", in, fullPath, size)
 	if file, ok := in.(*os.File); ok {
 		if _, err := file.Seek(0, io.SeekStart); err != nil {
 			return nil, false, err
 		}
+		fs.Debugf(f, "ensureCacheFile using direct *os.File path=%s size=%d", fullPath, size)
 		return file, false, nil
 	}
+	// Try to unwrap underlying *os.File if the reader exposes it (e.g. local backend).
+	if uf, ok := in.(readers.UnderlyingFile); ok {
+		if file := uf.UnderlyingFile(); file != nil {
+			if _, err := file.Seek(0, io.SeekStart); err == nil {
+				fs.Debugf(f, "ensureCacheFile using underlying *os.File from reader path=%s size=%d", fullPath, size)
+				return file, false, nil
+			}
+		}
+	}
+	fs.Debugf(f, "ensureCacheFile creating temp cache file path=%s size=%d", fullPath, size)
 	tmp, err := os.CreateTemp("", "baidunetdisk-*")
 	if err != nil {
 		return nil, false, err
