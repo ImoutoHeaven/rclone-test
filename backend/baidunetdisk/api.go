@@ -25,22 +25,23 @@ import (
 )
 
 const (
-	defaultUploadAPI              = "https://d.pcs.baidu.com"
-	defaultUploadThread           = 3
-	defaultUploadTimeout          = 60 * time.Second
-	defaultRetryCount             = 10
-	defaultRetryInitialWait       = time.Second
-	defaultRetryMaxWait           = 5 * time.Second
-	defaultOnlineAPIAddress       = "https://api.oplist.org/baiduyun/renewapi"
-	maxUploadThread               = 64
-	minUploadThread               = 1
-	maxSliceNum                   = 2048
-	defaultDynamicUploadRotate    = 256
-	defaultDynamicUploadRandom    = false
-	defaultSliceSize        int64 = 4 * 1024 * 1024
-	vipSliceSize            int64 = 16 * 1024 * 1024
-	svipSliceSize           int64 = 32 * 1024 * 1024
-	sliceStep               int64 = 1 * 1024 * 1024
+	defaultUploadAPI                   = "https://d.pcs.baidu.com"
+	defaultUploadThread                = 3
+	defaultUploadTimeout               = 60 * time.Second
+	defaultRetryCount                  = 10
+	defaultServersideMD5Override       = true
+	defaultRetryInitialWait            = time.Second
+	defaultRetryMaxWait                = 5 * time.Second
+	defaultOnlineAPIAddress            = "https://api.oplist.org/baiduyun/renewapi"
+	maxUploadThread                    = 64
+	minUploadThread                    = 1
+	maxSliceNum                        = 2048
+	defaultDynamicUploadRotate         = 256
+	defaultDynamicUploadRandom         = false
+	defaultSliceSize             int64 = 4 * 1024 * 1024
+	vipSliceSize                 int64 = 16 * 1024 * 1024
+	svipSliceSize                int64 = 32 * 1024 * 1024
+	sliceStep                    int64 = 1 * 1024 * 1024
 )
 
 // errnoError wraps baidu errno so callers can inspect it.
@@ -54,26 +55,27 @@ func (e errnoError) Error() string {
 
 // Options defines backend configuration.
 type Options struct {
-	RefreshToken           string        `config:"refresh_token"`
-	ClientID               string        `config:"client_id"`
-	ClientSecret           string        `config:"client_secret"`
-	UseOnlineAPI           bool          `config:"use_online_api"`
-	APIAddress             string        `config:"api_url_address"`
-	UploadThread           int           `config:"upload_thread"`
-	UploadTimeout          time.Duration `config:"upload_timeout"`
-	UploadAPI              string        `config:"upload_api"`
-	UseDynamicUploadAPI    bool          `config:"use_dynamic_upload_api"`
-	DynamicUploadAPIRotate int           `config:"dynamic_upload_api_rotate"`
-	DynamicUploadAPIRandom bool          `config:"dynamic_upload_api_random_pick"`
-	DynamicUploadAPISliceRandom bool     `config:"dynamic_upload_api_slice_random_pick"`
-	CustomUploadPartSize   int64         `config:"custom_upload_part_size"`
-	LowBandwidthUploadMode bool          `config:"low_bandwith_upload_mode"` //nolint:misspell // keep tag aligned with upstream naming
-	UploadRetryCount       int           `config:"upload_retry_count"`
-	UploadRetryWait        time.Duration `config:"upload_retry_initial_wait"`
-	UploadRetryMaxWait     time.Duration `config:"upload_retry_max_wait"`
-	AccessToken            string        `config:"access_token"`
-	OrderBy                string        `config:"order_by"`
-	OrderDirection         string        `config:"order_direction"`
+	RefreshToken                string        `config:"refresh_token"`
+	ClientID                    string        `config:"client_id"`
+	ClientSecret                string        `config:"client_secret"`
+	UseOnlineAPI                bool          `config:"use_online_api"`
+	APIAddress                  string        `config:"api_url_address"`
+	UploadThread                int           `config:"upload_thread"`
+	UploadTimeout               time.Duration `config:"upload_timeout"`
+	UploadAPI                   string        `config:"upload_api"`
+	UseDynamicUploadAPI         bool          `config:"use_dynamic_upload_api"`
+	DynamicUploadAPIRotate      int           `config:"dynamic_upload_api_rotate"`
+	DynamicUploadAPIRandom      bool          `config:"dynamic_upload_api_random_pick"`
+	DynamicUploadAPISliceRandom bool          `config:"dynamic_upload_api_slice_random_pick"`
+	CustomUploadPartSize        int64         `config:"custom_upload_part_size"`
+	LowBandwidthUploadMode      bool          `config:"low_bandwith_upload_mode"` //nolint:misspell // keep tag aligned with upstream naming
+	UploadRetryCount            int           `config:"upload_retry_count"`
+	UploadRetryWait             time.Duration `config:"upload_retry_initial_wait"`
+	UploadRetryMaxWait          time.Duration `config:"upload_retry_max_wait"`
+	AccessToken                 string        `config:"access_token"`
+	OrderBy                     string        `config:"order_by"`
+	OrderDirection              string        `config:"order_direction"`
+	ServersideMD5Override       bool          `config:"serverside_md5_override"`
 }
 
 // uploadProgressStore persists upload progress on disk (per content-md5 + access_token).
@@ -214,6 +216,11 @@ var configOptions = []fs.Option{{
 	Name:     "order_direction",
 	Help:     "List ordering direction (asc|desc).",
 	Default:  "asc",
+	Advanced: true,
+}, {
+	Name:     "serverside_md5_override",
+	Help:     "When true, use per-slice MD5 returned by Baidu server to build block_list for create; when false, use locally computed MD5 list.",
+	Default:  defaultServersideMD5Override,
 	Advanced: true,
 }}
 
@@ -683,15 +690,13 @@ func (f *Fs) locateUpload(ctx context.Context, fullPath, uploadID string) (strin
 	// Prefer https servers; optionally random pick when enabled.
 	pickRandom := f.opt.DynamicUploadAPIRandom
 
-	httpsFromList := func(list []struct{ Server string `json:"server"` }) []string {
-		out := make([]string, 0, len(list))
-		for _, s := range list {
-			if strings.HasPrefix(s.Server, "https://") {
-				out = append(out, s.Server)
-			}
+	httpsFromList := func(list []struct {
+		Server string `json:"server"`
+	}) []string { out := make([]string, 0, len(list)); for _, s := range list {
+		if strings.HasPrefix(s.Server, "https://") {
+			out = append(out, s.Server)
 		}
-		return out
-	}
+	}; return out }
 
 	serversHTTPS := httpsFromList(payload.Servers)
 	if len(serversHTTPS) > 0 {

@@ -42,6 +42,9 @@ type Fs struct {
 	progressStore *uploadProgressStore
 	uploadHostsMu sync.Mutex
 	uploadHosts   map[string][]string
+
+	serverMD5Mu sync.Mutex
+	serverMD5   map[string]map[int]string
 }
 
 // Object represents a Baidu Netdisk object.
@@ -95,6 +98,7 @@ func NewFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, e
 		client:        newHTTPClient(ctx),
 		progressStore: newUploadProgressStore(name),
 		uploadHosts:   make(map[string][]string),
+		serverMD5:     make(map[string]map[int]string),
 	}
 	if err := f.ensureAccessToken(ctx); err != nil {
 		return nil, err
@@ -438,15 +442,39 @@ func (f *Fs) put(ctx context.Context, in io.Reader, src fs.ObjectInfo, _ []fs.Op
 		fs.Debugf(f, "upload parts failed path=%s uploadid=%s err=%v", full, precreate.UploadID, err)
 		return nil, err
 	}
+
+	var blockListForCreate []byte
+	if f.opt.ServersideMD5Override {
+		serverList, ok := f.buildServerBlockList(precreate.UploadID, len(blockList))
+		if !ok {
+			fs.Debugf(f, "server-side md5 override enabled but missing md5 for some parts path=%s uploadid=%s expected=%d", full, precreate.UploadID, len(blockList))
+			f.progressStore.Save(key, nil)
+			f.clearServerBlockList(precreate.UploadID)
+			return nil, fmt.Errorf("server-side md5 override: missing md5 for some parts")
+		}
+		serverBlockListStr, err2 := json.Marshal(serverList)
+		if err2 != nil {
+			f.progressStore.Save(key, nil)
+			f.clearServerBlockList(precreate.UploadID)
+			return nil, err2
+		}
+		blockListForCreate = serverBlockListStr
+		fs.Debugf(f, "server-side md5 override using server block_list path=%s uploadid=%s blocks=%d", full, precreate.UploadID, len(serverList))
+	} else {
+		blockListForCreate = blockListStr
+	}
+
+	fs.Debugf(f, "calling create path=%s uploadid=%s blocks=%d serverside_md5_override=%v", full, precreate.UploadID, len(blockList), f.opt.ServersideMD5Override)
 	f.progressStore.Save(key, nil)
 
-	fs.Debugf(f, "calling create path=%s uploadid=%s blocks=%d", full, precreate.UploadID, len(blockList))
-	fileInfo, err := f.apiCreate(ctx, full, size, 0, precreate.UploadID, string(blockListStr), ctime, mtime)
+	fileInfo, err := f.apiCreate(ctx, full, size, 0, precreate.UploadID, string(blockListForCreate), ctime, mtime)
 	if err != nil {
 		fs.Debugf(f, "create failed path=%s uploadid=%s err=%v", full, precreate.UploadID, err)
+		f.clearServerBlockList(precreate.UploadID)
 		return nil, err
 	}
 	fs.Debugf(f, "create ok path=%s fsid=%d size=%d", full, fileInfo.FsID, fileInfo.Size)
+	f.clearServerBlockList(precreate.UploadID)
 	info := fileInfo.toObjectInfo(f.root)
 	// Baidu's create API returns \"now\" as mtime even when local_mtime is
 	// set; mirror OpenList by overriding the returned timestamps so rclone's
@@ -634,14 +662,29 @@ func (f *Fs) uploadSlice(ctx context.Context, uploadURL, fullPath, uploadID, fil
 		(strings.Contains(lower, "invalid") || strings.Contains(lower, "expired") || strings.Contains(lower, "not found")) {
 		return errUploadIDExpired
 	}
-	var errno struct {
-		Errno     int `json:"errno"`
-		ErrorCode int `json:"error_code"`
+	var payload struct {
+		Errno     int    `json:"errno"`
+		ErrorCode int    `json:"error_code"`
+		Md5       string `json:"md5"`
 	}
-	_ = json.Unmarshal(respBody, &errno)
-	if errno.Errno != 0 || errno.ErrorCode != 0 {
-		fs.Debugf(f, "upload slice failed host=%s path=%s uploadid=%s part=%d errno=%d code=%d", uploadURL, fullPath, uploadID, partSeq, errno.Errno, errno.ErrorCode)
-		return fmt.Errorf("upload slice failed: errno=%d code=%d resp=%s", errno.Errno, errno.ErrorCode, string(respBody))
+	_ = json.Unmarshal(respBody, &payload)
+	if payload.Errno != 0 || payload.ErrorCode != 0 {
+		fs.Debugf(f, "upload slice failed host=%s path=%s uploadid=%s part=%d errno=%d code=%d", uploadURL, fullPath, uploadID, partSeq, payload.Errno, payload.ErrorCode)
+		return fmt.Errorf("upload slice failed: errno=%d code=%d resp=%s", payload.Errno, payload.ErrorCode, string(respBody))
+	}
+	if f.opt.ServersideMD5Override {
+		if payload.Md5 == "" {
+			fs.Debugf(f, "upload slice missing md5 host=%s path=%s uploadid=%s part=%d resp=%s", uploadURL, fullPath, uploadID, partSeq, strings.TrimSpace(string(respBody)))
+			return fmt.Errorf("upload slice missing md5 in response")
+		}
+		f.serverMD5Mu.Lock()
+		m := f.serverMD5[uploadID]
+		if m == nil {
+			m = make(map[int]string)
+			f.serverMD5[uploadID] = m
+		}
+		m[partSeq] = strings.ToLower(payload.Md5)
+		f.serverMD5Mu.Unlock()
 	}
 	return nil
 }
@@ -697,6 +740,30 @@ func computeHashes(file *os.File, size, sliceSize int64) (string, string, []stri
 		return "", "", nil, err
 	}
 	return hex.EncodeToString(fileMd5.Sum(nil)), hex.EncodeToString(first256.Sum(nil)), blockList, nil
+}
+
+func (f *Fs) buildServerBlockList(uploadID string, count int) ([]string, bool) {
+	f.serverMD5Mu.Lock()
+	defer f.serverMD5Mu.Unlock()
+	m, ok := f.serverMD5[uploadID]
+	if !ok || m == nil {
+		return nil, false
+	}
+	out := make([]string, count)
+	for i := 0; i < count; i++ {
+		md5, ok := m[i]
+		if !ok || md5 == "" {
+			return nil, false
+		}
+		out[i] = md5
+	}
+	return out, true
+}
+
+func (f *Fs) clearServerBlockList(uploadID string) {
+	f.serverMD5Mu.Lock()
+	defer f.serverMD5Mu.Unlock()
+	delete(f.serverMD5, uploadID)
 }
 
 // ensureCacheFile ensures we have a seekable file for upload.
