@@ -57,24 +57,24 @@ rclone-bd config
   - 在线 API 地址，默认 `https://api.oplist.org/baiduyun/renewapi`。
 
 - `upload_thread`（高级）
-  - 并发上传分片数量，范围 `1–64`，默认 `3`。
+  - 并发上传分片数量，范围 `1–64`，默认 `32`。
   - 实际并发 = 此值；无需再额外加 Semaphore。
 
 - `upload_timeout`（高级）
-  - 单个分片上传超时（秒）。超时会触发该分片重试。
+  - 单个分片上传超时（秒），默认 `60` 秒。超时会触发该分片重试。
 
 - `upload_api`（高级）
   - 固定上传域名，默认 `https://d.pcs.baidu.com`。
   - 当未启用动态上传域名或 `locateupload` 调用失败时，会回退使用该值。
 
 - `use_dynamic_upload_api` / `dynamic_upload_api_rotate`（高级）
-  - `use_dynamic_upload_api=true` 时，会调用官方 `locateupload` 接口为每个上传会话解析推荐的上传域名。
+  - `use_dynamic_upload_api` 默认 `true`：会调用官方 `locateupload` 接口为每个上传会话解析推荐的上传域名；设为 `false` 时，仅使用 `upload_api`。
   - `dynamic_upload_api_rotate` 控制分片上传过程中多久重新解析一次上传域名（默认 `256`，单位：分片序号；设为 `0` 可禁用轮换，仅首次解析一次）。
 
 - `dynamic_upload_api_random_pick`（高级）
-  - 配合 `use_dynamic_upload_api=true` 使用。
+  - 配合 `use_dynamic_upload_api=true` 使用，默认 `true`。
   - 为 `true` 时，从 `locateupload` 返回的 https `servers` 列表中随机选择一个上传域名；若该列表为空，则从 `bak_servers` 的 https 域名中随机选择。
-  - 为 `false`（默认）时，始终选择 https servers 列表中的第一个（若有），行为更稳定可预测。
+  - 为 `false` 时，始终选择 https servers 列表中的第一个（若有），行为更稳定可预测。
 
 - `dynamic_upload_api_slice_random_pick`（高级）
   - 配合 `use_dynamic_upload_api=true` 使用。
@@ -86,7 +86,7 @@ rclone-bd config
   - 受会员等级限制：普通用户固定 4 MiB，VIP / SVIP 有更大上限。
 
 - `low_bandwith_upload_mode`（高级）
-  - 是否启用“低带宽模式”：从 4 MiB 开始逐步增大分片大小，保证总分片数 ≤ 2048。
+  - 是否启用“低带宽模式”，默认 `true`：从 4 MiB 开始逐步增大分片大小，保证总分片数 ≤ 2048。
 
 - `upload_retry_count`（高级）
   - 每个分片的最大重试次数。默认 `10`。
@@ -96,7 +96,7 @@ rclone-bd config
   - 退避策略为指数退避，封顶于 `upload_retry_max_wait`。
 
 - `serverside_md5_override`（高级）
-  - 默认 `true`。
+  - 默认 `false`。
   - `true`：precreate 仍按本地计算的 `block_list` 提交，但真正执行最终 `create` 时，会完全使用每个分片 `superfile2` 响应中**服务端返回的 md5 列表**来构造 `block_list`；如果某个分片响应缺失 md5，则该分片会被视为失败并重试，最终若仍有分片缺 md5，则整次上传失败（不会静默回退到本地 md5）。
   - `false`：`create` 仅使用本地计算的分片 md5 列表，`superfile2` 的 md5 仅用于日志/排错，不参与 `block_list` 纠偏。无论该选项如何设置，本后端对外都不声明 HashMD5 支持。
 

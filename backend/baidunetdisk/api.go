@@ -26,10 +26,10 @@ import (
 
 const (
 	defaultUploadAPI                   = "https://d.pcs.baidu.com"
-	defaultUploadThread                = 3
+	defaultUploadThread                = 32
 	defaultUploadTimeout               = 60 * time.Second
 	defaultRetryCount                  = 10
-	defaultServersideMD5Override       = true
+	defaultServersideMD5Override       = false
 	defaultRetryInitialWait            = time.Second
 	defaultRetryMaxWait                = 5 * time.Second
 	defaultOnlineAPIAddress            = "https://api.oplist.org/baiduyun/renewapi"
@@ -37,7 +37,7 @@ const (
 	minUploadThread                    = 1
 	maxSliceNum                        = 2048
 	defaultDynamicUploadRotate         = 256
-	defaultDynamicUploadRandom         = false
+	defaultDynamicUploadRandom         = true
 	defaultSliceSize             int64 = 4 * 1024 * 1024
 	vipSliceSize                 int64 = 16 * 1024 * 1024
 	svipSliceSize                int64 = 32 * 1024 * 1024
@@ -190,7 +190,7 @@ var configOptions = []fs.Option{{
 }, {
 	Name:     "low_bandwith_upload_mode", //nolint:misspell // keep option name for compatibility
 	Help:     "Enable low bandwidth mode (increase slice size gradually to keep part count <= 2048).",
-	Default:  false,
+	Default:  true,
 	Advanced: true,
 }, {
 	Name:     "upload_retry_count",
