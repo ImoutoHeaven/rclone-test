@@ -95,6 +95,11 @@ rclone-bd config
   - 分片重试的初始退避时间 / 最大退避时间（默认为 1s / 5s）。
   - 退避策略为指数退避，封顶于 `upload_retry_max_wait`。
 
+- `serverside_md5_override`（高级）
+  - 默认 `true`。
+  - `true`：precreate 仍按本地计算的 `block_list` 提交，但真正执行最终 `create` 时，会完全使用每个分片 `superfile2` 响应中**服务端返回的 md5 列表**来构造 `block_list`；如果某个分片响应缺失 md5，则该分片会被视为失败并重试，最终若仍有分片缺 md5，则整次上传失败（不会静默回退到本地 md5）。
+  - `false`：`create` 仅使用本地计算的分片 md5 列表，`superfile2` 的 md5 仅用于日志/排错，不参与 `block_list` 纠偏。无论该选项如何设置，本后端对外都不声明 HashMD5 支持。
+
 - `order_by` / `order_direction`（高级）
   - 列目录排序字段：`name|time|size`，默认 `name`。
   - 排序方向：`asc|desc`，默认 `asc`。
