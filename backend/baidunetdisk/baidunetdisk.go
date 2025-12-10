@@ -396,11 +396,30 @@ func (f *Fs) put(ctx context.Context, in io.Reader, src fs.ObjectInfo, _ []fs.Op
 		return obj, nil
 	}
 
+	retryLimit := f.opt.CreateErrno10RetryCount
+
+	for attempt := 0; ; attempt++ {
+		obj, err := f.uploadOnce(ctx, cacheFile, full, size, modTime, sliceSize, blockList, blockListStr, contentMd5, sliceMd5)
+		if err == nil {
+			return obj, nil
+		}
+		var ee errnoError
+		if errors.As(err, &ee) && ee.code == 10 && attempt < retryLimit {
+			fs.Debugf(f, "create errno=10, internal retry %d/%d path=%s size=%d", attempt+1, retryLimit, full, size)
+			continue
+		}
+		return nil, err
+	}
+}
+
+// uploadOnce performs a full precreate -> upload -> create attempt once.
+func (f *Fs) uploadOnce(ctx context.Context, cacheFile *os.File, full string, size int64, modTime time.Time, sliceSize int64, blockList []string, blockListStr []byte, contentMd5, sliceMd5 string) (fs.Object, error) {
 	ctime := modTime.Unix()
 	mtime := modTime.Unix()
 	key := contentMd5 + "_" + f.getAccessToken()
 	precreate, ok := f.progressStore.Load(key)
 	if !ok {
+		var err error
 		precreate, err = f.apiPrecreate(ctx, full, size, string(blockListStr), contentMd5, sliceMd5, ctime, mtime)
 		if err != nil {
 			return nil, err
@@ -419,7 +438,7 @@ func (f *Fs) put(ctx context.Context, in io.Reader, src fs.ObjectInfo, _ []fs.Op
 
 	for retry := 0; retry < 2; retry++ {
 		fs.Debugf(f, "upload parts path=%s uploadid=%s attempt=%d pending=%d", full, precreate.UploadID, retry, countPending(precreate.BlockList))
-		err = f.uploadParts(ctx, precreate, cacheFile, full, path.Base(full), size, sliceSize)
+		err := f.uploadParts(ctx, precreate, cacheFile, full, path.Base(full), size, sliceSize)
 		if err == nil {
 			break
 		}
@@ -453,11 +472,11 @@ func (f *Fs) put(ctx context.Context, in io.Reader, src fs.ObjectInfo, _ []fs.Op
 			f.clearServerBlockList(precreate.UploadID)
 			return nil, fmt.Errorf("server-side md5 override: missing md5 for some parts")
 		}
-		serverBlockListStr, err2 := json.Marshal(serverList)
-		if err2 != nil {
+		serverBlockListStr, err := json.Marshal(serverList)
+		if err != nil {
 			f.progressStore.Save(key, nil)
 			f.clearServerBlockList(precreate.UploadID)
-			return nil, err2
+			return nil, err
 		}
 		blockListForCreate = serverBlockListStr
 		fs.Debugf(f, "server-side md5 override using server block_list path=%s uploadid=%s blocks=%d", full, precreate.UploadID, len(serverList))

@@ -25,23 +25,24 @@ import (
 )
 
 const (
-	defaultUploadAPI                   = "https://d.pcs.baidu.com"
-	defaultUploadThread                = 32
-	defaultUploadTimeout               = 60 * time.Second
-	defaultRetryCount                  = 10
-	defaultServersideMD5Override       = false
-	defaultRetryInitialWait            = time.Second
-	defaultRetryMaxWait                = 5 * time.Second
-	defaultOnlineAPIAddress            = "https://api.oplist.org/baiduyun/renewapi"
-	maxUploadThread                    = 64
-	minUploadThread                    = 1
-	maxSliceNum                        = 2048
-	defaultDynamicUploadRotate         = 256
-	defaultDynamicUploadRandom         = true
-	defaultSliceSize             int64 = 4 * 1024 * 1024
-	vipSliceSize                 int64 = 16 * 1024 * 1024
-	svipSliceSize                int64 = 32 * 1024 * 1024
-	sliceStep                    int64 = 1 * 1024 * 1024
+	defaultUploadAPI                     = "https://d.pcs.baidu.com"
+	defaultUploadThread                  = 32
+	defaultUploadTimeout                 = 60 * time.Second
+	defaultRetryCount                    = 10
+	defaultServersideMD5Override         = false
+	defaultRetryInitialWait              = time.Second
+	defaultRetryMaxWait                  = 5 * time.Second
+	defaultOnlineAPIAddress              = "https://api.oplist.org/baiduyun/renewapi"
+	defaultCreateErrno10RetryCount       = 5
+	maxUploadThread                      = 64
+	minUploadThread                      = 1
+	maxSliceNum                          = 2048
+	defaultDynamicUploadRotate           = 256
+	defaultDynamicUploadRandom           = true
+	defaultSliceSize               int64 = 4 * 1024 * 1024
+	vipSliceSize                   int64 = 16 * 1024 * 1024
+	svipSliceSize                  int64 = 32 * 1024 * 1024
+	sliceStep                      int64 = 1 * 1024 * 1024
 )
 
 // errnoError wraps baidu errno so callers can inspect it.
@@ -73,6 +74,7 @@ type Options struct {
 	UploadRetryWait             time.Duration `config:"upload_retry_initial_wait"`
 	UploadRetryMaxWait          time.Duration `config:"upload_retry_max_wait"`
 	AccessToken                 string        `config:"access_token"`
+	CreateErrno10RetryCount     int           `config:"create_errno10_retry_count"`
 	OrderBy                     string        `config:"order_by"`
 	OrderDirection              string        `config:"order_direction"`
 	ServersideMD5Override       bool          `config:"serverside_md5_override"`
@@ -208,6 +210,11 @@ var configOptions = []fs.Option{{
 	Default:  fs.Duration(defaultRetryMaxWait),
 	Advanced: true,
 }, {
+	Name:     "create_errno10_retry_count",
+	Help:     "Internal retry count when create returns errno=10 (0 to disable internal retry).",
+	Default:  defaultCreateErrno10RetryCount,
+	Advanced: true,
+}, {
 	Name:     "order_by",
 	Help:     "List ordering field (name|time|size).",
 	Default:  "name",
@@ -260,6 +267,9 @@ func (o *Options) setDefaults() {
 	}
 	if o.UploadRetryMaxWait == 0 {
 		o.UploadRetryMaxWait = defaultRetryMaxWait
+	}
+	if o.CreateErrno10RetryCount < 0 {
+		o.CreateErrno10RetryCount = 0
 	}
 	if o.OrderBy == "" {
 		o.OrderBy = "name"
@@ -566,41 +576,10 @@ func (f *Fs) apiCreate(ctx context.Context, fullPath string, size int64, isDir i
 	}
 
 	var resp File
-	// 针对 errno=10（百度侧分片校验/时序问题）做有限次退避重试：
-	// 间隔 30s 和 60s，共 3 次尝试。
-	delays := []time.Duration{30 * time.Second, 60 * time.Second}
-	maxAttempts := len(delays) + 1
-
-	for attempt := 0; attempt < maxAttempts; attempt++ {
-		_, err := f.apiPostForm(ctx, "/xpan/file", params, form, &resp)
-		if err == nil {
-			return &resp, nil
-		}
-
-		var ee errnoError
-		if !errors.As(err, &ee) || ee.code != 10 {
-			// 非 errno=10 的错误不在这里重试，直接返回
-			return nil, err
-		}
-
-		// errno=10 视为可能的服务端时序问题，做有限次延迟重试
-		if attempt >= len(delays) {
-			// 已达到最大重试次数，仍然 errno=10
-			return nil, err
-		}
-
-		wait := delays[attempt]
-		fs.Debugf(f, "create errno=10, retrying in %v (attempt %d/%d) path=%s size=%d", wait, attempt+1, maxAttempts, fullPath, size)
-
-		// 等待时尊重 context 取消
-		select {
-		case <-ctx.Done():
-			return nil, ctx.Err()
-		case <-time.After(wait):
-		}
+	if _, err := f.apiPostForm(ctx, "/xpan/file", params, form, &resp); err != nil {
+		return nil, err
 	}
-
-	return nil, errnoError{code: 10}
+	return &resp, nil
 }
 
 // apiPrecreate wraps precreate call. content/slice md5 included only when provided.
@@ -692,11 +671,15 @@ func (f *Fs) locateUpload(ctx context.Context, fullPath, uploadID string) (strin
 
 	httpsFromList := func(list []struct {
 		Server string `json:"server"`
-	}) []string { out := make([]string, 0, len(list)); for _, s := range list {
-		if strings.HasPrefix(s.Server, "https://") {
-			out = append(out, s.Server)
+	}) []string {
+		out := make([]string, 0, len(list))
+		for _, s := range list {
+			if strings.HasPrefix(s.Server, "https://") {
+				out = append(out, s.Server)
+			}
 		}
-	}; return out }
+		return out
+	}
 
 	serversHTTPS := httpsFromList(payload.Servers)
 	if len(serversHTTPS) > 0 {
