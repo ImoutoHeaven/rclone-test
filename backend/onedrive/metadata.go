@@ -321,7 +321,7 @@ func (m *Metadata) Write(ctx context.Context, updatePermissions bool) (*api.Item
 	var info *api.Item
 	err := m.fs.pacer.Call(func() (bool, error) {
 		resp, err := m.fs.srv.CallJSON(ctx, &opts, &update, &info)
-		return shouldRetry(ctx, resp, err)
+		return m.fs.shouldRetry(ctx, resp, err)
 	})
 	if err != nil {
 		fs.Debugf(m.remote, "errored metadata: %v", m)
@@ -637,7 +637,7 @@ func (m *Metadata) addPermission(ctx context.Context, p *api.PermissionsType) (n
 	newP := &api.PermissionsResponse{}
 	err = m.fs.pacer.Call(func() (bool, error) {
 		resp, err = m.fs.srv.CallJSON(ctx, &opts, &req, &newP)
-		return shouldRetry(ctx, resp, err)
+		return m.fs.shouldRetry(ctx, resp, err)
 	})
 
 	return newP.Value, resp, err
@@ -657,7 +657,7 @@ func (m *Metadata) updatePermission(ctx context.Context, p *api.PermissionsType)
 	newP = &api.PermissionsType{}
 	err = m.fs.pacer.Call(func() (bool, error) {
 		resp, err = m.fs.srv.CallJSON(ctx, &opts, &req, &newP)
-		return shouldRetry(ctx, resp, err)
+		return m.fs.shouldRetry(ctx, resp, err)
 	})
 
 	return newP, resp, err
@@ -671,7 +671,7 @@ func (m *Metadata) removePermission(ctx context.Context, p *api.PermissionsType)
 
 	err = m.fs.pacer.Call(func() (bool, error) {
 		resp, err = m.fs.srv.CallJSON(ctx, &opts, nil, nil)
-		return shouldRetry(ctx, resp, err)
+		return m.fs.shouldRetry(ctx, resp, err)
 	})
 	return resp, err
 }
@@ -683,7 +683,7 @@ func (f *Fs) getPermissions(ctx context.Context, normalizedID string) (p []*api.
 	permResp := &api.PermissionsResponse{}
 	err = f.pacer.Call(func() (bool, error) {
 		resp, err = f.srv.CallJSON(ctx, &opts, nil, &permResp)
-		return shouldRetry(ctx, resp, err)
+		return f.shouldRetry(ctx, resp, err)
 	})
 
 	return permResp.Value, resp, err
@@ -882,7 +882,7 @@ func (f *Fs) createDir(ctx context.Context, pathID, dirWithLeaf, leaf string, me
 
 	err = f.pacer.Call(func() (bool, error) {
 		resp, err = f.srv.CallJSON(ctx, &opts, &mkdir, &info)
-		return shouldRetry(ctx, resp, err)
+		return f.shouldRetry(ctx, resp, err)
 	})
 	if err != nil {
 		return nil, m, err

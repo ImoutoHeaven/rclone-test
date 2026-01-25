@@ -16,6 +16,7 @@ import (
 	"net/url"
 	"os"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/rclone/rclone/fs"
@@ -337,7 +338,7 @@ type Transport struct {
 	ci            *fs.ConfigInfo
 	dump          fs.DumpFlags
 	filterRequest func(req *http.Request)
-	userAgent     string
+	userAgent     atomic.Value
 	headers       []*fs.HTTPOption
 	metrics       *Metrics
 	// Mutex for serializing attempts at reloading the certificates
@@ -347,19 +348,25 @@ type Transport struct {
 // newTransport wraps the http.Transport passed in and logs all
 // roundtrips including the body if logBody is set.
 func newTransport(ci *fs.ConfigInfo, transport *http.Transport) *Transport {
-	return &Transport{
+	t := &Transport{
 		Transport: transport,
 		ci:        ci,
 		dump:      ci.Dump,
-		userAgent: ci.UserAgent,
 		headers:   ci.Headers,
 		metrics:   DefaultMetrics,
 	}
+	t.userAgent.Store(ci.UserAgent)
+	return t
 }
 
 // SetRequestFilter sets a filter to be used on each request
 func (t *Transport) SetRequestFilter(f func(req *http.Request)) {
 	t.filterRequest = f
+}
+
+// SetUserAgent updates the User-Agent used for requests.
+func (t *Transport) SetUserAgent(ua string) {
+	t.userAgent.Store(ua)
 }
 
 // A mutex to protect this map
@@ -470,7 +477,11 @@ func (t *Transport) RoundTrip(req *http.Request) (resp *http.Response, err error
 	// Limit transactions per second if required
 	accounting.LimitTPS(req.Context())
 	// Force user agent
-	req.Header.Set("User-Agent", t.userAgent)
+	ua, _ := t.userAgent.Load().(string)
+	if ua == "" {
+		ua = t.ci.UserAgent
+	}
+	req.Header.Set("User-Agent", ua)
 	// Set user defined headers
 	for _, option := range t.headers {
 		req.Header.Set(option.Key, option.Value)

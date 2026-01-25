@@ -4,6 +4,7 @@ package onedrive
 
 import (
 	"context"
+	cryptorand "crypto/rand"
 	_ "embed"
 	"encoding/base64"
 	"encoding/hex"
@@ -11,8 +12,10 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math/big"
 	"net/http"
 	"net/url"
+	"os"
 	"path"
 	"regexp"
 	"strconv"
@@ -254,6 +257,11 @@ cases, rclone will fall back to normal copy (which will be slightly slower).`,
 			Name:     "list_chunk",
 			Help:     "Size of listing chunk.",
 			Default:  1000,
+			Advanced: true,
+		}, {
+			Name:    "random_user_agent_file",
+			Help:    "Path to a file with one User-Agent per line. On HTTP 429/503, a random User-Agent from this file is selected for subsequent requests (empty lines ignored, whitespace trimmed).",
+			Default: "",
 			Advanced: true,
 		}, {
 			Name:    "no_versions",
@@ -774,6 +782,7 @@ type Options struct {
 	ExposeOneNoteFiles      bool                 `config:"expose_onenote_files"`
 	ServerSideAcrossConfigs bool                 `config:"server_side_across_configs"`
 	ListChunk               int64                `config:"list_chunk"`
+	RandomUserAgentFile     string               `config:"random_user_agent_file"`
 	NoVersions              bool                 `config:"no_versions"`
 	HardDelete              bool                 `config:"hard_delete"`
 	LinkScope               string               `config:"link_scope"`
@@ -784,6 +793,10 @@ type Options struct {
 	Delta                   bool                 `config:"delta"`
 	Enc                     encoder.MultiEncoder `config:"encoding"`
 	MetadataPermissions     rwChoice             `config:"metadata_permissions"`
+}
+
+type userAgentSetter interface {
+	SetUserAgent(string)
 }
 
 // Fs represents a remote OneDrive
@@ -797,6 +810,7 @@ type Fs struct {
 	unAuth       *rest.Client       // no authentication connection to the OneDrive server
 	dirCache     *dircache.DirCache // Map of directory path to directory id
 	pacer        *fs.Pacer          // pacer for API calls
+	uaSetter     userAgentSetter    // updates User-Agent for this backend
 	tokenRenewer *oauthutil.Renew   // renew the token on expiry
 	driveID      string             // ID to use for querying Microsoft Graph
 	driveType    string             // https://developer.microsoft.com/en-us/graph/docs/api-reference/v1.0/resources/drive
@@ -874,7 +888,7 @@ var (
 
 // shouldRetry returns a boolean as to whether this resp and err
 // deserve to be retried.  It returns the err as a convenience
-func shouldRetry(ctx context.Context, resp *http.Response, err error) (bool, error) {
+func (f *Fs) shouldRetry(ctx context.Context, resp *http.Response, err error) (bool, error) {
 	if fserrors.ContextError(ctx, &err) {
 		return false, err
 	}
@@ -897,15 +911,21 @@ func shouldRetry(ctx context.Context, resp *http.Response, err error) (bool, err
 			}
 		case 429, 503: // Too Many Requests, Server Too Busy
 			// see https://docs.microsoft.com/en-us/sharepoint/dev/general-development/how-to-avoid-getting-throttled-or-blocked-in-sharepoint-online
+			f.rotateUserAgentOnRateLimit(resp.StatusCode)
 			if values := resp.Header["Retry-After"]; len(values) == 1 && values[0] != "" {
 				retryAfter, parseErr := strconv.Atoi(values[0])
 				if parseErr != nil {
 					fs.Debugf(nil, "Failed to parse Retry-After: %q: %v", values[0], parseErr)
 				} else {
 					duration := time.Second * time.Duration(retryAfter)
+					maxRetryAfter := time.Duration(f.ci.RetryAfterMax)
+					if maxRetryAfter > 0 && duration > maxRetryAfter {
+						fs.Debugf(nil, "Retry-After %v exceeds max %v, capping", duration, maxRetryAfter)
+						duration = maxRetryAfter
+					}
 					retry = true
 					err = pacer.RetryAfterError(err, duration)
-					fs.Debugf(nil, "Too many requests. Trying again in %d seconds.", retryAfter)
+					fs.Debugf(nil, "Too many requests. Trying again in %v.", duration)
 				}
 			}
 		case 504: // Gateway timeout
@@ -917,6 +937,58 @@ func shouldRetry(ctx context.Context, resp *http.Response, err error) (bool, err
 		}
 	}
 	return retry || fserrors.ShouldRetry(err) || fserrors.ShouldRetryHTTP(resp, retryErrorCodes), err
+}
+
+func (f *Fs) rotateUserAgentOnRateLimit(statusCode int) {
+	if f.uaSetter == nil {
+		return
+	}
+	uaFile := strings.TrimSpace(f.opt.RandomUserAgentFile)
+	if uaFile == "" {
+		return
+	}
+	ua, err := randomUserAgentFromFile(uaFile)
+	if err != nil {
+		fs.Debugf(f, "Random User-Agent file %q unusable: %v", uaFile, err)
+		return
+	}
+	f.uaSetter.SetUserAgent(ua)
+	fs.Debugf(f, "Rotated User-Agent to %q after HTTP %d", ua, statusCode)
+}
+
+func randomUserAgentFromFile(path string) (string, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return "", err
+	}
+	lines := strings.Split(string(data), "\n")
+	userAgents := make([]string, 0, len(lines))
+	for _, line := range lines {
+		ua := strings.TrimSpace(line)
+		if ua != "" {
+			userAgents = append(userAgents, ua)
+		}
+	}
+	if len(userAgents) == 0 {
+		return "", errors.New("no usable user agents in file")
+	}
+	idx, err := randomIndex(len(userAgents))
+	if err != nil {
+		return "", err
+	}
+	return userAgents[idx], nil
+}
+
+func randomIndex(n int) (int, error) {
+	if n <= 1 {
+		return 0, nil
+	}
+	max := big.NewInt(int64(n))
+	val, err := cryptorand.Int(cryptorand.Reader, max)
+	if err != nil {
+		return 0, err
+	}
+	return int(val.Int64()), nil
 }
 
 // readMetaDataForPathRelativeToID reads the metadata for a path relative to an item that is addressed by its normalized ID.
@@ -933,7 +1005,7 @@ func (f *Fs) readMetaDataForPathRelativeToID(ctx context.Context, normalizedID s
 
 	err = f.pacer.Call(func() (bool, error) {
 		resp, err = f.srv.CallJSON(ctx, &opts, nil, &info)
-		return shouldRetry(ctx, resp, err)
+		return f.shouldRetry(ctx, resp, err)
 	})
 
 	return info, resp, err
@@ -948,7 +1020,7 @@ func (f *Fs) readMetaDataForPath(ctx context.Context, path string) (info *api.It
 		opts.Path = strings.TrimSuffix(opts.Path, ":")
 		err = f.pacer.Call(func() (bool, error) {
 			resp, err = f.srv.CallJSON(ctx, &opts, nil, &info)
-			return shouldRetry(ctx, resp, err)
+			return f.shouldRetry(ctx, resp, err)
 		})
 		return info, resp, err
 	}
@@ -1076,6 +1148,10 @@ func NewFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, e
 	}
 
 	client := fshttp.NewClient(ctx)
+	var uaSetter userAgentSetter
+	if setter, ok := client.Transport.(userAgentSetter); ok {
+		uaSetter = setter
+	}
 	root = parsePath(root)
 	oAuthClient, ts, err := oauthutil.NewClientWithBaseClient(ctx, name, m, oauthConfig, client)
 	if err != nil {
@@ -1093,6 +1169,7 @@ func NewFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, e
 		srv:       rest.NewClient(oAuthClient).SetRoot(rootURL),
 		unAuth:    rest.NewClient(client).SetRoot(rootURL),
 		pacer:     fs.NewPacer(ctx, pacer.NewDefault(pacer.MinSleep(minSleep), pacer.MaxSleep(maxSleep), pacer.DecayConstant(decayConstant))),
+		uaSetter:  uaSetter,
 		hashType:  QuickXorHashType,
 	}
 	f.features = (&fs.Features{
@@ -1257,7 +1334,7 @@ func (f *Fs) CreateDir(ctx context.Context, dirID, leaf string) (newID string, e
 	}
 	err = f.pacer.Call(func() (bool, error) {
 		resp, err = f.srv.CallJSON(ctx, &opts, &mkdir, &info)
-		return shouldRetry(ctx, resp, err)
+		return f.shouldRetry(ctx, resp, err)
 	})
 	if err != nil {
 		// fmt.Printf("...Error %v\n", err)
@@ -1286,7 +1363,7 @@ func (f *Fs) _listAll(ctx context.Context, dirID string, directoriesOnly bool, f
 		var resp *http.Response
 		err = f.pacer.Call(func() (bool, error) {
 			resp, err = f.srv.CallJSON(ctx, opts, nil, result)
-			return shouldRetry(ctx, resp, err)
+			return f.shouldRetry(ctx, resp, err)
 		})
 		if err != nil {
 			return fmt.Errorf("couldn't list files: %w", err)
@@ -1600,7 +1677,7 @@ func (f *Fs) deleteObject(ctx context.Context, id string) error {
 
 	return f.pacer.Call(func() (bool, error) {
 		resp, err := f.srv.Call(ctx, &opts)
-		return shouldRetry(ctx, resp, err)
+		return f.shouldRetry(ctx, resp, err)
 	})
 }
 
@@ -1767,7 +1844,7 @@ func (f *Fs) Copy(ctx context.Context, src fs.Object, remote string) (dst fs.Obj
 	var resp *http.Response
 	err = f.pacer.Call(func() (bool, error) {
 		resp, err = f.srv.CallJSON(ctx, &opts, &copyReq, nil)
-		return shouldRetry(ctx, resp, err)
+		return f.shouldRetry(ctx, resp, err)
 	})
 	if err != nil {
 		return nil, err
@@ -1869,7 +1946,7 @@ func (f *Fs) Move(ctx context.Context, src fs.Object, remote string) (fs.Object,
 	var info *api.Item
 	err = f.pacer.Call(func() (bool, error) {
 		resp, err = f.srv.CallJSON(ctx, &opts, &move, &info)
-		return shouldRetry(ctx, resp, err)
+		return f.shouldRetry(ctx, resp, err)
 	})
 	if err != nil {
 		return nil, err
@@ -1945,7 +2022,7 @@ func (f *Fs) DirMove(ctx context.Context, src fs.Fs, srcRemote, dstRemote string
 	var info api.Item
 	err = f.pacer.Call(func() (bool, error) {
 		resp, err = f.srv.CallJSON(ctx, &opts, &move, &info)
-		return shouldRetry(ctx, resp, err)
+		return f.shouldRetry(ctx, resp, err)
 	})
 	if err != nil {
 		return err
@@ -1971,7 +2048,7 @@ func (f *Fs) About(ctx context.Context) (usage *fs.Usage, err error) {
 	var resp *http.Response
 	err = f.pacer.Call(func() (bool, error) {
 		resp, err = f.srv.CallJSON(ctx, &opts, nil, &drive)
-		return shouldRetry(ctx, resp, err)
+		return f.shouldRetry(ctx, resp, err)
 	})
 	if err != nil {
 		return nil, err
@@ -2018,7 +2095,7 @@ func (f *Fs) PublicLink(ctx context.Context, remote string, expire fs.Duration, 
 	var result api.CreateShareLinkResponse
 	err = f.pacer.Call(func() (bool, error) {
 		resp, err = f.srv.CallJSON(ctx, &opts, &share, &result)
-		return shouldRetry(ctx, resp, err)
+		return f.shouldRetry(ctx, resp, err)
 	})
 	if err != nil {
 		if resp != nil && resp.StatusCode == 400 && f.driveType != driveTypePersonal {
@@ -2142,7 +2219,7 @@ func (o *Object) deleteVersions(ctx context.Context) error {
 	var versions api.VersionsResponse
 	err := o.fs.pacer.Call(func() (bool, error) {
 		resp, err := o.fs.srv.CallJSON(ctx, &opts, nil, &versions)
-		return shouldRetry(ctx, resp, err)
+		return o.fs.shouldRetry(ctx, resp, err)
 	})
 	if err != nil {
 		return err
@@ -2169,7 +2246,7 @@ func (o *Object) deleteVersion(ctx context.Context, ID string) error {
 	opts.NoResponse = true
 	return o.fs.pacer.Call(func() (bool, error) {
 		resp, err := o.fs.srv.Call(ctx, &opts)
-		return shouldRetry(ctx, resp, err)
+		return o.fs.shouldRetry(ctx, resp, err)
 	})
 }
 
@@ -2342,7 +2419,7 @@ func (o *Object) setModTime(ctx context.Context, modTime time.Time) (*api.Item, 
 	var info *api.Item
 	err := o.fs.pacer.Call(func() (bool, error) {
 		resp, err := o.fs.srv.CallJSON(ctx, &opts, &update, &info)
-		return shouldRetry(ctx, resp, err)
+		return o.fs.shouldRetry(ctx, resp, err)
 	})
 	// Remove versions if required
 	if o.fs.opt.NoVersions {
@@ -2401,7 +2478,7 @@ func (o *Object) Open(ctx context.Context, options ...fs.OpenOption) (in io.Read
 			// It is a redirect which we are expecting
 			err = nil
 		}
-		return shouldRetry(ctx, resp, err)
+		return o.fs.shouldRetry(ctx, resp, err)
 	})
 	if err != nil {
 		if resp != nil {
@@ -2414,7 +2491,7 @@ func (o *Object) Open(ctx context.Context, options ...fs.OpenOption) (in io.Read
 	if redirectReq != nil {
 		err = o.fs.pacer.Call(func() (bool, error) {
 			resp, err = o.fs.unAuth.Do(redirectReq)
-			return shouldRetry(ctx, resp, err)
+			return o.fs.shouldRetry(ctx, resp, err)
 		})
 		if err != nil {
 			if resp != nil {
@@ -2449,7 +2526,7 @@ func (o *Object) createUploadSession(ctx context.Context, src fs.ObjectInfo, mod
 				err = errors.New(err.Error() + " (is it a OneNote file?)")
 			}
 		}
-		return shouldRetry(ctx, resp, err)
+		return o.fs.shouldRetry(ctx, resp, err)
 	})
 	return response, metadata, err
 }
@@ -2464,7 +2541,7 @@ func (o *Object) getPosition(ctx context.Context, url string) (pos int64, err er
 	var resp *http.Response
 	err = o.fs.pacer.Call(func() (bool, error) {
 		resp, err = o.fs.srv.CallJSON(ctx, &opts, nil, &info)
-		return shouldRetry(ctx, resp, err)
+		return o.fs.shouldRetry(ctx, resp, err)
 	})
 	if err != nil {
 		return 0, err
@@ -2528,11 +2605,11 @@ func (o *Object) uploadFragment(ctx context.Context, url string, start int64, to
 			return true, err
 		}
 		if err != nil {
-			return shouldRetry(ctx, resp, err)
+			return o.fs.shouldRetry(ctx, resp, err)
 		}
 		body, err = rest.ReadBody(resp)
 		if err != nil {
-			return shouldRetry(ctx, resp, err)
+			return o.fs.shouldRetry(ctx, resp, err)
 		}
 		if resp.StatusCode == 200 || resp.StatusCode == 201 {
 			// we are done :)
@@ -2555,7 +2632,7 @@ func (o *Object) cancelUploadSession(ctx context.Context, url string) (err error
 	var resp *http.Response
 	err = o.fs.pacer.Call(func() (bool, error) {
 		resp, err = o.fs.srv.Call(ctx, &opts)
-		return shouldRetry(ctx, resp, err)
+		return o.fs.shouldRetry(ctx, resp, err)
 	})
 	return
 }
@@ -2639,7 +2716,7 @@ func (o *Object) uploadSinglepart(ctx context.Context, in io.Reader, src fs.Obje
 				err = errors.New(err.Error() + " (is it a OneNote file?)")
 			}
 		}
-		return shouldRetry(ctx, resp, err)
+		return o.fs.shouldRetry(ctx, resp, err)
 	})
 	if err != nil {
 		return nil, err

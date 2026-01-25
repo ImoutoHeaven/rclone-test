@@ -166,16 +166,21 @@ var ConfigOptionsInfo = Options{{
 	Default: 3,
 	Help:    "Retry operations this many times if they fail",
 	Groups:  "Config",
-}, {
-	Name:    "retries_sleep",
-	Default: time.Duration(0),
-	Help:    "Interval between retrying operations if they fail, e.g. 500ms, 60s, 5m (0 to disable)",
-	Groups:  "Config",
-}, {
-	Name:    "low_level_retries",
-	Default: 10,
-	Help:    "Number of low level retries to do",
-	Groups:  "Config",
+	}, {
+		Name:    "retries_sleep",
+		Default: time.Duration(0),
+		Help:    "Interval between retrying operations if they fail, e.g. 500ms, 60s, 5m (0 to disable)",
+		Groups:  "Config",
+	}, {
+		Name:    "retry_after_max",
+		Default: Duration(300 * time.Second),
+		Help:    "Maximum time to honor Retry-After headers, e.g. 5m",
+		Groups:  "Config",
+	}, {
+		Name:    "low_level_retries",
+		Default: 10,
+		Help:    "Number of low level retries to do",
+		Groups:  "Config",
 }, {
 	Name:     "update",
 	ShortOpt: "u",
@@ -596,6 +601,7 @@ type ConfigInfo struct {
 	TrackRenamesStrategy       string            `config:"track_renames_strategy"` // Comma separated list of strategies used to track renames
 	Retries                    int               `config:"retries"`                // High-level retries
 	RetriesInterval            Duration          `config:"retries_sleep"`
+	RetryAfterMax              Duration          `config:"retry_after_max"`
 	LowLevelRetries            int               `config:"low_level_retries"`
 	UpdateOlder                bool              `config:"update"`           // Skip files that are newer on the destination
 	NoGzip                     bool              `config:"no_gzip_encoding"` // Disable compression
