@@ -6,6 +6,8 @@ build
 /docs/public/
 /docs/.hugo_build.lock
 /docs/static/img/logos/
+/docs/plans/
+/.worktrees/
 rclone.iml
 .idea
 .history
