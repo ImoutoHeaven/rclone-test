@@ -1,6 +1,6 @@
 % rclone(1) User Manual
 % Nick Craig-Wood
-% Nov 21, 2025
+% Apr 16, 2026
 
 # NAME
 
@@ -5369,12 +5369,12 @@ rclone convmv "stories/The Quick Brown Fox!.txt" --name-transform "all,command=e
 
 ```console
 rclone convmv "stories/The Quick Brown Fox!" --name-transform "date=-{YYYYMMDD}"
-// Output: stories/The Quick Brown Fox!-20251121
+// Output: stories/The Quick Brown Fox!-20260416
 ```
 
 ```console
 rclone convmv "stories/The Quick Brown Fox!" --name-transform "date=-{macfriendlytime}"
-// Output: stories/The Quick Brown Fox!-2025-11-21 0505PM
+// Output: stories/The Quick Brown Fox!-2026-04-16 0445PM
 ```
 
 ```console
@@ -7871,7 +7871,7 @@ rclone mount remote:path /path/to/mountpoint [flags]
       --direct-io                              Use Direct IO, disables caching of data
       --file-perms FileMode                    File permissions (default 666)
       --fuse-flag stringArray                  Flags or arguments to be passed direct to libfuse/WinFsp (repeat if required)
-      --gid uint32                             Override the gid field set by the filesystem (not supported on Windows) (default 1000)
+      --gid uint32                             Override the gid field set by the filesystem (not supported on Windows)
   -h, --help                                   help for mount
       --link-perms FileMode                    Link permissions (default 666)
       --max-read-ahead SizeSuffix              The number of bytes that can be prefetched for sequential reads (not supported on Windows) (default 128Ki)
@@ -7885,8 +7885,8 @@ rclone mount remote:path /path/to/mountpoint [flags]
   -o, --option stringArray                     Option for libfuse/WinFsp (repeat if required)
       --poll-interval Duration                 Time to wait between polling for changes, must be smaller than dir-cache-time and only on supported remotes (set 0 to disable) (default 1m0s)
       --read-only                              Only allow read-only access
-      --uid uint32                             Override the uid field set by the filesystem (not supported on Windows) (default 1000)
-      --umask FileMode                         Override the permission bits set by the filesystem (not supported on Windows) (default 002)
+      --uid uint32                             Override the uid field set by the filesystem (not supported on Windows)
+      --umask FileMode                         Override the permission bits set by the filesystem (not supported on Windows) (default 022)
       --vfs-block-norm-dupes                   If duplicate filenames exist in the same directory (after normalization), log an error and hide the duplicates (may have a performance cost)
       --vfs-cache-max-age Duration             Max time since last access of objects in the cache (default 1h0m0s)
       --vfs-cache-max-size SizeSuffix          Max total size of objects in the cache (default off)
@@ -8199,7 +8199,6 @@ press '?' to toggle the help on and off. The supported keys are:
  v select file/directory
  V enter visual select mode
  D delete selected files/directories
- y copy current path to clipboard
  Y display current path
  ^L refresh screen (fix screen corruption)
  r recalculate file sizes
@@ -9314,7 +9313,7 @@ rclone nfsmount remote:path /path/to/mountpoint [flags]
       --direct-io                              Use Direct IO, disables caching of data
       --file-perms FileMode                    File permissions (default 666)
       --fuse-flag stringArray                  Flags or arguments to be passed direct to libfuse/WinFsp (repeat if required)
-      --gid uint32                             Override the gid field set by the filesystem (not supported on Windows) (default 1000)
+      --gid uint32                             Override the gid field set by the filesystem (not supported on Windows)
   -h, --help                                   help for nfsmount
       --link-perms FileMode                    Link permissions (default 666)
       --max-read-ahead SizeSuffix              The number of bytes that can be prefetched for sequential reads (not supported on Windows) (default 128Ki)
@@ -9332,8 +9331,8 @@ rclone nfsmount remote:path /path/to/mountpoint [flags]
       --poll-interval Duration                 Time to wait between polling for changes, must be smaller than dir-cache-time and only on supported remotes (set 0 to disable) (default 1m0s)
       --read-only                              Only allow read-only access
       --sudo                                   Use sudo to run the mount/umount commands as root.
-      --uid uint32                             Override the uid field set by the filesystem (not supported on Windows) (default 1000)
-      --umask FileMode                         Override the permission bits set by the filesystem (not supported on Windows) (default 002)
+      --uid uint32                             Override the uid field set by the filesystem (not supported on Windows)
+      --umask FileMode                         Override the permission bits set by the filesystem (not supported on Windows) (default 022)
       --vfs-block-norm-dupes                   If duplicate filenames exist in the same directory (after normalization), log an error and hide the duplicates (may have a performance cost)
       --vfs-cache-max-age Duration             Max time since last access of objects in the cache (default 1h0m0s)
       --vfs-cache-max-size SizeSuffix          Max total size of objects in the cache (default off)
@@ -10571,7 +10570,7 @@ rclone serve dlna remote:path [flags]
       --dir-cache-time Duration                Time to cache directory entries for (default 5m0s)
       --dir-perms FileMode                     Directory permissions (default 777)
       --file-perms FileMode                    File permissions (default 666)
-      --gid uint32                             Override the gid field set by the filesystem (not supported on Windows) (default 1000)
+      --gid uint32                             Override the gid field set by the filesystem (not supported on Windows)
   -h, --help                                   help for dlna
       --interface stringArray                  The interface to use for SSDP (repeat as necessary)
       --link-perms FileMode                    Link permissions (default 666)
@@ -10582,8 +10581,8 @@ rclone serve dlna remote:path [flags]
       --no-seek                                Don't allow seeking in files
       --poll-interval Duration                 Time to wait between polling for changes, must be smaller than dir-cache-time and only on supported remotes (set 0 to disable) (default 1m0s)
       --read-only                              Only allow read-only access
-      --uid uint32                             Override the uid field set by the filesystem (not supported on Windows) (default 1000)
-      --umask FileMode                         Override the permission bits set by the filesystem (not supported on Windows) (default 002)
+      --uid uint32                             Override the uid field set by the filesystem (not supported on Windows)
+      --umask FileMode                         Override the permission bits set by the filesystem (not supported on Windows) (default 022)
       --vfs-block-norm-dupes                   If duplicate filenames exist in the same directory (after normalization), log an error and hide the duplicates (may have a performance cost)
       --vfs-cache-max-age Duration             Max time since last access of objects in the cache (default 1h0m0s)
       --vfs-cache-max-size SizeSuffix          Max total size of objects in the cache (default off)
@@ -11209,7 +11208,7 @@ rclone serve docker [flags]
       --file-perms FileMode                    File permissions (default 666)
       --forget-state                           Skip restoring previous state
       --fuse-flag stringArray                  Flags or arguments to be passed direct to libfuse/WinFsp (repeat if required)
-      --gid uint32                             Override the gid field set by the filesystem (not supported on Windows) (default 1000)
+      --gid uint32                             Override the gid field set by the filesystem (not supported on Windows)
   -h, --help                                   help for docker
       --link-perms FileMode                    Link permissions (default 666)
       --max-read-ahead SizeSuffix              The number of bytes that can be prefetched for sequential reads (not supported on Windows) (default 128Ki)
@@ -11225,9 +11224,9 @@ rclone serve docker [flags]
       --poll-interval Duration                 Time to wait between polling for changes, must be smaller than dir-cache-time and only on supported remotes (set 0 to disable) (default 1m0s)
       --read-only                              Only allow read-only access
       --socket-addr string                     Address <host:port> or absolute path (default: /run/docker/plugins/rclone.sock)
-      --socket-gid int                         GID for unix socket (default: current process GID) (default 1000)
-      --uid uint32                             Override the uid field set by the filesystem (not supported on Windows) (default 1000)
-      --umask FileMode                         Override the permission bits set by the filesystem (not supported on Windows) (default 002)
+      --socket-gid int                         GID for unix socket (default: current process GID)
+      --uid uint32                             Override the uid field set by the filesystem (not supported on Windows)
+      --umask FileMode                         Override the permission bits set by the filesystem (not supported on Windows) (default 022)
       --vfs-block-norm-dupes                   If duplicate filenames exist in the same directory (after normalization), log an error and hide the duplicates (may have a performance cost)
       --vfs-cache-max-age Duration             Max time since last access of objects in the cache (default 1h0m0s)
       --vfs-cache-max-size SizeSuffix          Max total size of objects in the cache (default off)
@@ -11906,7 +11905,7 @@ rclone serve ftp remote:path [flags]
       --dir-cache-time Duration                Time to cache directory entries for (default 5m0s)
       --dir-perms FileMode                     Directory permissions (default 777)
       --file-perms FileMode                    File permissions (default 666)
-      --gid uint32                             Override the gid field set by the filesystem (not supported on Windows) (default 1000)
+      --gid uint32                             Override the gid field set by the filesystem (not supported on Windows)
   -h, --help                                   help for ftp
       --key string                             TLS PEM Private key
       --link-perms FileMode                    Link permissions (default 666)
@@ -11918,8 +11917,8 @@ rclone serve ftp remote:path [flags]
       --poll-interval Duration                 Time to wait between polling for changes, must be smaller than dir-cache-time and only on supported remotes (set 0 to disable) (default 1m0s)
       --public-ip string                       Public IP address to advertise for passive connections
       --read-only                              Only allow read-only access
-      --uid uint32                             Override the uid field set by the filesystem (not supported on Windows) (default 1000)
-      --umask FileMode                         Override the permission bits set by the filesystem (not supported on Windows) (default 002)
+      --uid uint32                             Override the uid field set by the filesystem (not supported on Windows)
+      --umask FileMode                         Override the permission bits set by the filesystem (not supported on Windows) (default 022)
       --user string                            User name for authentication (default "anonymous")
       --vfs-block-norm-dupes                   If duplicate filenames exist in the same directory (after normalization), log an error and hide the duplicates (may have a performance cost)
       --vfs-cache-max-age Duration             Max time since last access of objects in the cache (default 1h0m0s)
@@ -12729,7 +12728,7 @@ rclone serve http remote:path [flags]
       --dir-perms FileMode                     Directory permissions (default 777)
       --disable-zip                            Disable zip download of directories
       --file-perms FileMode                    File permissions (default 666)
-      --gid uint32                             Override the gid field set by the filesystem (not supported on Windows) (default 1000)
+      --gid uint32                             Override the gid field set by the filesystem (not supported on Windows)
   -h, --help                                   help for http
       --htpasswd string                        A htpasswd file - if not provided no authentication is done
       --key string                             TLS PEM Private key
@@ -12747,8 +12746,8 @@ rclone serve http remote:path [flags]
       --server-read-timeout Duration           Timeout for server reading data (default 1h0m0s)
       --server-write-timeout Duration          Timeout for server writing data (default 1h0m0s)
       --template string                        User-specified template
-      --uid uint32                             Override the uid field set by the filesystem (not supported on Windows) (default 1000)
-      --umask FileMode                         Override the permission bits set by the filesystem (not supported on Windows) (default 002)
+      --uid uint32                             Override the uid field set by the filesystem (not supported on Windows)
+      --umask FileMode                         Override the permission bits set by the filesystem (not supported on Windows) (default 022)
       --user string                            User name for authentication
       --user-from-header string                User name from a defined HTTP header
       --vfs-block-norm-dupes                   If duplicate filenames exist in the same directory (after normalization), log an error and hide the duplicates (may have a performance cost)
@@ -13400,7 +13399,7 @@ rclone serve nfs remote:path [flags]
       --dir-cache-time Duration                Time to cache directory entries for (default 5m0s)
       --dir-perms FileMode                     Directory permissions (default 777)
       --file-perms FileMode                    File permissions (default 666)
-      --gid uint32                             Override the gid field set by the filesystem (not supported on Windows) (default 1000)
+      --gid uint32                             Override the gid field set by the filesystem (not supported on Windows)
   -h, --help                                   help for nfs
       --link-perms FileMode                    Link permissions (default 666)
       --nfs-cache-dir string                   The directory the NFS handle cache will use if set
@@ -13411,8 +13410,8 @@ rclone serve nfs remote:path [flags]
       --no-seek                                Don't allow seeking in files
       --poll-interval Duration                 Time to wait between polling for changes, must be smaller than dir-cache-time and only on supported remotes (set 0 to disable) (default 1m0s)
       --read-only                              Only allow read-only access
-      --uid uint32                             Override the uid field set by the filesystem (not supported on Windows) (default 1000)
-      --umask FileMode                         Override the permission bits set by the filesystem (not supported on Windows) (default 002)
+      --uid uint32                             Override the uid field set by the filesystem (not supported on Windows)
+      --umask FileMode                         Override the permission bits set by the filesystem (not supported on Windows) (default 022)
       --vfs-block-norm-dupes                   If duplicate filenames exist in the same directory (after normalization), log an error and hide the duplicates (may have a performance cost)
       --vfs-cache-max-age Duration             Max time since last access of objects in the cache (default 1h0m0s)
       --vfs-cache-max-size SizeSuffix          Max total size of objects in the cache (default off)
@@ -14469,7 +14468,7 @@ rclone serve s3 remote:path [flags]
       --etag-hash string                       Which hash to use for the ETag, or auto or blank for off (default "MD5")
       --file-perms FileMode                    File permissions (default 666)
       --force-path-style                       If true use path style access if false use virtual hosted style (default true)
-      --gid uint32                             Override the gid field set by the filesystem (not supported on Windows) (default 1000)
+      --gid uint32                             Override the gid field set by the filesystem (not supported on Windows)
   -h, --help                                   help for s3
       --htpasswd string                        A htpasswd file - if not provided no authentication is done
       --key string                             TLS PEM Private key
@@ -14487,8 +14486,8 @@ rclone serve s3 remote:path [flags]
       --salt string                            Password hashing salt (default "dlPL2MqE")
       --server-read-timeout Duration           Timeout for server reading data (default 1h0m0s)
       --server-write-timeout Duration          Timeout for server writing data (default 1h0m0s)
-      --uid uint32                             Override the uid field set by the filesystem (not supported on Windows) (default 1000)
-      --umask FileMode                         Override the permission bits set by the filesystem (not supported on Windows) (default 002)
+      --uid uint32                             Override the uid field set by the filesystem (not supported on Windows)
+      --umask FileMode                         Override the permission bits set by the filesystem (not supported on Windows) (default 022)
       --user string                            User name for authentication
       --user-from-header string                User name from a defined HTTP header
       --vfs-block-norm-dupes                   If duplicate filenames exist in the same directory (after normalization), log an error and hide the duplicates (may have a performance cost)
@@ -15214,7 +15213,7 @@ rclone serve sftp remote:path [flags]
       --dir-cache-time Duration                Time to cache directory entries for (default 5m0s)
       --dir-perms FileMode                     Directory permissions (default 777)
       --file-perms FileMode                    File permissions (default 666)
-      --gid uint32                             Override the gid field set by the filesystem (not supported on Windows) (default 1000)
+      --gid uint32                             Override the gid field set by the filesystem (not supported on Windows)
   -h, --help                                   help for sftp
       --key stringArray                        SSH private host key file (Can be multi-valued, leave blank to auto generate)
       --link-perms FileMode                    Link permissions (default 666)
@@ -15226,8 +15225,8 @@ rclone serve sftp remote:path [flags]
       --poll-interval Duration                 Time to wait between polling for changes, must be smaller than dir-cache-time and only on supported remotes (set 0 to disable) (default 1m0s)
       --read-only                              Only allow read-only access
       --stdio                                  Run an sftp server on stdin/stdout
-      --uid uint32                             Override the uid field set by the filesystem (not supported on Windows) (default 1000)
-      --umask FileMode                         Override the permission bits set by the filesystem (not supported on Windows) (default 002)
+      --uid uint32                             Override the uid field set by the filesystem (not supported on Windows)
+      --umask FileMode                         Override the permission bits set by the filesystem (not supported on Windows) (default 022)
       --user string                            User name for authentication
       --vfs-block-norm-dupes                   If duplicate filenames exist in the same directory (after normalization), log an error and hide the duplicates (may have a performance cost)
       --vfs-cache-max-age Duration             Max time since last access of objects in the cache (default 1h0m0s)
@@ -16095,7 +16094,7 @@ rclone serve webdav remote:path [flags]
       --disable-dir-list                       Disable HTML directory list on GET request for a directory
       --etag-hash string                       Which hash to use for the ETag, or auto or blank for off
       --file-perms FileMode                    File permissions (default 666)
-      --gid uint32                             Override the gid field set by the filesystem (not supported on Windows) (default 1000)
+      --gid uint32                             Override the gid field set by the filesystem (not supported on Windows)
   -h, --help                                   help for webdav
       --htpasswd string                        A htpasswd file - if not provided no authentication is done
       --key string                             TLS PEM Private key
@@ -16113,8 +16112,8 @@ rclone serve webdav remote:path [flags]
       --server-read-timeout Duration           Timeout for server reading data (default 1h0m0s)
       --server-write-timeout Duration          Timeout for server writing data (default 1h0m0s)
       --template string                        User-specified template
-      --uid uint32                             Override the uid field set by the filesystem (not supported on Windows) (default 1000)
-      --umask FileMode                         Override the permission bits set by the filesystem (not supported on Windows) (default 002)
+      --uid uint32                             Override the uid field set by the filesystem (not supported on Windows)
+      --umask FileMode                         Override the permission bits set by the filesystem (not supported on Windows) (default 022)
       --user string                            User name for authentication
       --user-from-header string                User name from a defined HTTP header
       --vfs-block-norm-dupes                   If duplicate filenames exist in the same directory (after normalization), log an error and hide the duplicates (may have a performance cost)
@@ -24802,7 +24801,7 @@ Flags for general networking and HTTP stuff.
       --tpslimit float                     Limit HTTP transactions per second to this
       --tpslimit-burst int                 Max burst of transactions for --tpslimit (default 1)
       --use-cookies                        Enable session cookiejar
-      --user-agent string                  Set the user-agent to a specified string (default "rclone/v1.72.0")
+      --user-agent string                  Set the user-agent to a specified string (default "rclone/v1.73.0-beta.9367.d0a9a51f3.drive-upload-daily-budget-2026-04-16")
 ```
 
 
@@ -24843,6 +24842,7 @@ Flags for general configuration of rclone.
       --password-command SpaceSepList       Command for supplying password for encrypted configuration
       --retries int                         Retry operations this many times if they fail (default 3)
       --retries-sleep Duration              Interval between retrying operations if they fail, e.g. 500ms, 60s, 5m (0 to disable) (default 0s)
+      --retry-after-max Duration            Maximum time to honor Retry-After headers, e.g. 5m (default 5m0s)
       --temp-dir string                     Directory rclone will use for temporary files (default "/tmp")
       --use-mmap                            Use mmap allocator (see docs)
       --use-server-modtime                  Use server modified time instead of object metadata
@@ -25110,6 +25110,28 @@ Backend-only flags (these can be set in the config file also).
       --b2-upload-cutoff SizeSuffix                         Cutoff for switching to chunked upload (default 200Mi)
       --b2-version-at Time                                  Show file versions as they were at the specified time (default off)
       --b2-versions                                         Include old versions in directory listings
+      --baidunetdisk-api-url-address string                 Online API address for token refresh (default "https://api.oplist.org/baiduyun/renewapi")
+      --baidunetdisk-client-id string                       Client ID for local OAuth refresh
+      --baidunetdisk-client-secret string                   Client Secret for local OAuth refresh
+      --baidunetdisk-create-errno10-retry-count int         Internal retry count when create returns errno=10 (0 to disable internal retry) (default 5)
+      --baidunetdisk-custom-upload-part-size int            Custom upload part size in bytes (0 for auto, limited by VIP type)
+      --baidunetdisk-description string                     Description of the remote
+      --baidunetdisk-dynamic-upload-api-random-pick         When dynamic upload api is enabled, randomly pick from https servers list instead of always using the first one (default true)
+      --baidunetdisk-dynamic-upload-api-rotate int          When dynamic upload api is enabled, re-resolve upload domain every N parts (0 to disable rotation) (default 256)
+      --baidunetdisk-dynamic-upload-api-slice-random-pick   When dynamic upload api is enabled, randomly pick upload host for each slice and retry using cached https servers
+      --baidunetdisk-low-bandwith-upload-mode               Enable low bandwidth mode (increase slice size gradually to keep part count <= 2048) (default true)
+      --baidunetdisk-order-by string                        List ordering field (name|time|size) (default "name")
+      --baidunetdisk-order-direction string                 List ordering direction (asc|desc) (default "asc")
+      --baidunetdisk-refresh-token string                   Baidu Netdisk refresh token
+      --baidunetdisk-serverside-md5-override                When true, use per-slice MD5 returned by Baidu server to build block_list for create; when false, use locally computed MD5 list
+      --baidunetdisk-upload-api string                      Fixed upload api endpoint (default "https://d.pcs.baidu.com")
+      --baidunetdisk-upload-retry-count int                 Max retries per slice (default 10)
+      --baidunetdisk-upload-retry-initial-wait Duration     Initial backoff for slice retry (default 1s)
+      --baidunetdisk-upload-retry-max-wait Duration         Max backoff for slice retry (default 5s)
+      --baidunetdisk-upload-thread int                      Concurrent upload threads (1-64) (default 32)
+      --baidunetdisk-upload-timeout Duration                Per-slice upload timeout in seconds (default 1m0s)
+      --baidunetdisk-use-dynamic-upload-api                 Use locateupload to resolve upload domain dynamically; falls back to upload_api on failure (default true)
+      --baidunetdisk-use-online-api                         Use online API to refresh token (default true)
       --box-access-token string                             Box App Primary Access Token
       --box-auth-url string                                 Auth server URL
       --box-box-config-file string                          Box App config.json location
@@ -25226,6 +25248,7 @@ Backend-only flags (these can be set in the config file also).
       --drive-skip-dangling-shortcuts                       If set skip dangling shortcut files
       --drive-skip-gdocs                                    Skip google documents in all listings
       --drive-skip-shortcuts                                If set skip shortcut files
+      --drive-sleep-on-upload-limit                         If enabled, upload operations sleep until next UTC day when daily upload budget is reached
       --drive-starred-only                                  Only show files that are starred
       --drive-stop-on-download-limit                        Make download limit errors be fatal
       --drive-stop-on-upload-limit                          Make upload limit errors be fatal
@@ -25234,6 +25257,7 @@ Backend-only flags (these can be set in the config file also).
       --drive-token-url string                              Token server url
       --drive-trashed-only                                  Only show files that are in the trash
       --drive-upload-cutoff SizeSuffix                      Cutoff for switching to chunked upload (default 8Mi)
+      --drive-upload-daily-limit SizeSuffix                 Daily successful upload budget used with --drive-sleep-on-upload-limit (default 750Gi)
       --drive-use-created-date                              Use file created date instead of modified date
       --drive-use-shared-date                               Use date file was shared instead of modified date
       --drive-use-trash                                     Send files to the trash instead of deleting permanently (default true)
@@ -25497,6 +25521,7 @@ Backend-only flags (these can be set in the config file also).
       --onedrive-list-chunk int                             Size of listing chunk (default 1000)
       --onedrive-metadata-permissions Bits                  Control whether permissions should be read or written in metadata (default off)
       --onedrive-no-versions                                Remove all versions on modifying operations
+      --onedrive-random-user-agent-file string              Path to a file with one User-Agent per line. On HTTP 429/503, a random User-Agent from this file is selected for subsequent requests (empty lines ignored, whitespace trimmed)
       --onedrive-region string                              Choose national cloud region for OneDrive (default "global")
       --onedrive-root-folder-id string                      ID of the root folder
       --onedrive-server-side-across-configs                 Deprecated: use --server-side-across-configs instead
@@ -27514,7 +27539,20 @@ The following backends have known issues that need more investigation:
 <!--- start list_failures - DO NOT EDIT THIS SECTION - use make commanddocs --->
 - `TestDropbox` (`dropbox`)
   - [`TestBisyncRemoteRemote/normalization`](https://pub.rclone.org/integration-tests/current/dropbox-cmd.bisync-TestDropbox-1.txt)
-- Updated: 2025-11-21-010037
+- `TestS3Minio` (`s3`)
+  - [`TestBisyncRemoteLocal/all_changed`](https://pub.rclone.org/integration-tests/current/s3-cmd.bisync-TestS3Minio-1.txt)
+  - [`TestBisyncRemoteLocal/backupdir`](https://pub.rclone.org/integration-tests/current/s3-cmd.bisync-TestS3Minio-1.txt)
+  - [`TestBisyncRemoteLocal/basic`](https://pub.rclone.org/integration-tests/current/s3-cmd.bisync-TestS3Minio-1.txt)
+  - [`TestBisyncRemoteLocal/changes`](https://pub.rclone.org/integration-tests/current/s3-cmd.bisync-TestS3Minio-1.txt)
+  - [`TestBisyncRemoteLocal/check_access`](https://pub.rclone.org/integration-tests/current/s3-cmd.bisync-TestS3Minio-1.txt)
+  - [79 more](https://pub.rclone.org/integration-tests/current/)
+- `TestSFTPOpenssh` (`sftp`)
+  - [`TestBisyncLocalRemote/concurrent`](https://pub.rclone.org/integration-tests/current/sftp-cmd.bisync-TestSFTPOpenssh-1.txt)
+  - [`TestBisyncRemoteRemote/concurrent`](https://pub.rclone.org/integration-tests/current/sftp-cmd.bisync-TestSFTPOpenssh-1.txt)
+- `TestSFTPRclone` (`sftp`)
+  - [`TestBisyncLocalRemote/concurrent`](https://pub.rclone.org/integration-tests/current/sftp-cmd.bisync-TestSFTPRclone-1.txt)
+  - [`TestBisyncRemoteRemote/concurrent`](https://pub.rclone.org/integration-tests/current/sftp-cmd.bisync-TestSFTPRclone-1.txt)
+- Updated: 2026-04-14-010012
 <!--- end list_failures - DO NOT EDIT THIS SECTION - use make commanddocs --->
 
 The following backends either have not been tested recently or have known issues
@@ -38626,7 +38664,7 @@ It is useful to know how many requests are sent to the server in different scena
 All copy commands send the following 4 requests:
 
 ```text
-/b2api/v1/b2_authorize_account
+/b2api/v4/b2_authorize_account
 /b2api/v1/b2_create_bucket
 /b2api/v1/b2_list_buckets
 /b2api/v1/b2_list_file_names
@@ -43973,6 +44011,9 @@ managing files in the cloud easy. Its cross-platform file backup
 services let you upload and back up files from any internet-connected
 device.
 
+**Note** FileLu now has a fully featured S3 backend [FileLu S5](/s3#filelu-s5),
+an industry standard S3 compatible object store.
+
 ## Configuration
 
 Here is an example of how to make a remote called `filelu`. First, run:
@@ -46379,7 +46420,7 @@ account key" button.
   `https://www.googleapis.com/auth/drive`
   to grant read/write access to Google Drive specifically.
   You can also use `https://www.googleapis.com/auth/drive.readonly` for read
-  only access.
+  only access with `--drive-scope=drive.readonly`.
 - Click "Authorise"
 
 ##### 3. Configure rclone, assuming a new install
@@ -47305,6 +47346,30 @@ Properties:
 - Env Var:     RCLONE_DRIVE_DISABLE_HTTP2
 - Type:        bool
 - Default:     true
+
+#### --drive-sleep-on-upload-limit
+
+If enabled, upload operations sleep until next UTC day when daily upload budget is reached.
+
+Properties:
+
+- Config:      sleep_on_upload_limit
+- Env Var:     RCLONE_DRIVE_SLEEP_ON_UPLOAD_LIMIT
+- Type:        bool
+- Default:     false
+
+#### --drive-upload-daily-limit
+
+Daily successful upload budget used with --drive-sleep-on-upload-limit.
+Examples: 750G, 750Gi, 750GiB.
+
+
+Properties:
+
+- Config:      upload_daily_limit
+- Env Var:     RCLONE_DRIVE_UPLOAD_DAILY_LIMIT
+- Type:        SizeSuffix
+- Default:     750Gi
 
 #### --drive-stop-on-upload-limit
 
@@ -53431,6 +53496,26 @@ MD5 hashes are stored with blobs. However blobs that were uploaded in
 chunks only have an MD5 if the source remote was capable of MD5
 hashes, e.g. the local disk.
 
+### Metadata and tags
+
+Rclone can map arbitrary metadata to Azure Blob headers, user metadata, and tags
+when `--metadata` is enabled (or when using `--metadata-set` / `--metadata-mapper`).
+
+- Headers: Set these keys in metadata to map to the corresponding blob headers:
+  - `cache-control`, `content-disposition`, `content-encoding`, `content-language`, `content-type`.
+- User metadata: Any other non-reserved keys are written as user metadata
+  (keys are normalized to lowercase). Keys starting with `x-ms-` are reserved and
+  are not stored as user metadata.
+- Tags: Provide `x-ms-tags` as a comma-separated list of `key=value` pairs, e.g.
+  `x-ms-tags=env=dev,team=sync`. These are applied as blob tags on upload and on
+  server-side copies. Whitespace around keys/values is ignored.
+- Modtime override: Provide `mtime` in RFC3339/RFC3339Nano format to override the
+  stored modtime persisted in user metadata. If `mtime` cannot be parsed, rclone
+  logs a debug message and ignores the override.
+
+Notes:
+- Rclone ignores reserved `x-ms-*` keys (except `x-ms-tags`) for user metadata.
+
 ### Performance
 
 When uploading large files, increasing the value of
@@ -54367,6 +54452,24 @@ Properties:
 - Env Var:     RCLONE_AZUREBLOB_DESCRIPTION
 - Type:        string
 - Required:    false
+
+### Metadata
+
+User metadata is stored as x-ms-meta- keys. Azure metadata keys are case insensitive and are always returned in lower case.
+
+Here are the possible system metadata items for the azureblob backend.
+
+| Name | Help | Type | Example | Read Only |
+|------|------|------|---------|-----------|
+| cache-control | Cache-Control header | string | no-cache | N |
+| content-disposition | Content-Disposition header | string | inline | N |
+| content-encoding | Content-Encoding header | string | gzip | N |
+| content-language | Content-Language header | string | en-US | N |
+| content-type | Content-Type header | string | text/plain | N |
+| mtime | Time of last modification, read from rclone metadata | RFC 3339 | 2006-01-02T15:04:05.999999999Z07:00 | N |
+| tier | Tier of the object | string | Hot | **Y** |
+
+See the [metadata](https://rclone.org/docs/#metadata) docs for more info.
 
 <!-- autogenerated options stop -->
 
@@ -55825,6 +55928,17 @@ Properties:
 - Env Var:     RCLONE_ONEDRIVE_LIST_CHUNK
 - Type:        int
 - Default:     1000
+
+#### --onedrive-random-user-agent-file
+
+Path to a file with one User-Agent per line. On HTTP 429/503, a random User-Agent from this file is selected for subsequent requests (empty lines ignored, whitespace trimmed).
+
+Properties:
+
+- Config:      random_user_agent_file
+- Env Var:     RCLONE_ONEDRIVE_RANDOM_USER_AGENT_FILE
+- Type:        string
+- Required:    false
 
 #### --onedrive-no-versions
 
@@ -66887,7 +67001,7 @@ Options:
   - [rclone test speed](https://rclone.org/commands/rclone_test_speed/): Add command to test a specified remotes speed (dougal)
 - New Features
   - backends: many backends have has a paged listing (`ListP`) interface added
-      - this enables progress when listing large directories and reduced memory usage
+    - this enables progress when listing large directories and reduced memory usage
   - build
     - Bump golang.org/x/crypto from 0.43.0 to 0.45.0 to fix CVE-2025-58181 (dependabot[bot])
     - Modernize code and tests (Nick Craig-Wood, russcoss, juejinyuxitu, reddaisyy, dulanting, Oleksandr Redko)
@@ -74410,6 +74524,8 @@ put them back in again. -->
 - jijamik <30904953+jijamik@users.noreply.github.com>
 - Dominik Sander <git@dsander.de>
 - Nikolay Kiryanov <nikolay@kiryanov.ru>
+- Diana <5275194+DianaNites@users.noreply.github.com>
+- Duncan Smart <duncan.smart@gmail.com>
 
 # Contact the rclone project
 

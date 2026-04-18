@@ -106,6 +106,19 @@ var permissionsFields = googleapi.Field(strings.Join([]string{
 
 // getPermission returns permissions for the fileID and permissionID passed in
 func (f *Fs) getPermission(ctx context.Context, fileID, permissionID string, useCache bool) (perm *drive.Permission, inherited bool, err error) {
+	ctx, err = f.bindRuntimeForReadCall(ctx)
+	if err != nil {
+		return nil, false, err
+	}
+	svc, err := f.svcFor(ctx)
+	if err != nil {
+		return nil, false, err
+	}
+	pacerInstance, err := f.pacerFor(ctx)
+	if err != nil {
+		return nil, false, err
+	}
+
 	f.permissionsMu.Lock()
 	defer f.permissionsMu.Unlock()
 	if useCache {
@@ -115,8 +128,8 @@ func (f *Fs) getPermission(ctx context.Context, fileID, permissionID string, use
 		}
 	}
 	fs.Debugf(f, "Fetching permission %q", permissionID)
-	err = f.pacer.Call(func() (bool, error) {
-		perm, err = f.svc.Permissions.Get(fileID, permissionID).
+	err = pacerInstance.Call(func() (bool, error) {
+		perm, err = svc.Permissions.Get(fileID, permissionID).
 			Fields(permissionsFields).
 			SupportsAllDrives(true).
 			Context(ctx).Do()
@@ -138,6 +151,19 @@ func (f *Fs) getPermission(ctx context.Context, fileID, permissionID string, use
 
 // Set the permissions on the info
 func (f *Fs) setPermissions(ctx context.Context, info *drive.File, permissions []*drive.Permission) (err error) {
+	ctx, _, err = bindAccountForWriteObject(ctx, f)
+	if err != nil {
+		return err
+	}
+	svc, err := f.svcFor(ctx)
+	if err != nil {
+		return err
+	}
+	pacerInstance, err := f.pacerFor(ctx)
+	if err != nil {
+		return err
+	}
+
 	errs := errcount.New()
 	for _, perm := range permissions {
 		if perm.Role == "owner" {
@@ -145,8 +171,8 @@ func (f *Fs) setPermissions(ctx context.Context, info *drive.File, permissions [
 			continue
 		}
 		cleanPermissionForWrite(perm)
-		err := f.pacer.Call(func() (bool, error) {
-			_, err := f.svc.Permissions.Create(info.Id, perm).
+		err := pacerInstance.Call(func() (bool, error) {
+			_, err := svc.Permissions.Create(info.Id, perm).
 				SupportsAllDrives(true).
 				SendNotificationEmail(false).
 				Context(ctx).Do()
@@ -220,13 +246,26 @@ var labelsFields = googleapi.Field(strings.Join([]string{
 
 // getLabels returns labels for the fileID passed in
 func (f *Fs) getLabels(ctx context.Context, fileID string) (labels []*drive.Label, err error) {
+	ctx, err = f.bindRuntimeForReadCall(ctx)
+	if err != nil {
+		return nil, err
+	}
+	svc, err := f.svcFor(ctx)
+	if err != nil {
+		return nil, err
+	}
+	pacerInstance, err := f.pacerFor(ctx)
+	if err != nil {
+		return nil, err
+	}
+
 	fs.Debugf(f, "Fetching labels for %q", fileID)
-	listLabels := f.svc.Files.ListLabels(fileID).
+	listLabels := svc.Files.ListLabels(fileID).
 		Fields(labelsFields).
 		Context(ctx)
 	for {
 		var info *drive.LabelList
-		err = f.pacer.Call(func() (bool, error) {
+		err = pacerInstance.Call(func() (bool, error) {
 			info, err = listLabels.Do()
 			return f.shouldRetry(ctx, err)
 		})
@@ -250,6 +289,19 @@ func (f *Fs) setLabels(ctx context.Context, info *drive.File, labels []*drive.La
 	if len(labels) == 0 {
 		return nil
 	}
+	ctx, _, err = bindAccountForWriteObject(ctx, f)
+	if err != nil {
+		return err
+	}
+	svc, err := f.svcFor(ctx)
+	if err != nil {
+		return err
+	}
+	pacerInstance, err := f.pacerFor(ctx)
+	if err != nil {
+		return err
+	}
+
 	req := drive.ModifyLabelsRequest{}
 	for _, label := range labels {
 		req.LabelModifications = append(req.LabelModifications, &drive.LabelModification{
@@ -257,8 +309,8 @@ func (f *Fs) setLabels(ctx context.Context, info *drive.File, labels []*drive.La
 			LabelId:            label.Id,
 		})
 	}
-	err = f.pacer.Call(func() (bool, error) {
-		_, err = f.svc.Files.ModifyLabels(info.Id, &req).
+	err = pacerInstance.Call(func() (bool, error) {
+		_, err = svc.Files.ModifyLabels(info.Id, &req).
 			Context(ctx).Do()
 		return f.shouldRetry(ctx, err)
 	})
@@ -468,6 +520,19 @@ func (o *baseObject) parseMetadata(ctx context.Context, info *drive.File) (err e
 
 // Set the owner on the info
 func (f *Fs) setOwner(ctx context.Context, info *drive.File, owner string) (err error) {
+	ctx, _, err = bindAccountForWriteObject(ctx, f)
+	if err != nil {
+		return err
+	}
+	svc, err := f.svcFor(ctx)
+	if err != nil {
+		return err
+	}
+	pacerInstance, err := f.pacerFor(ctx)
+	if err != nil {
+		return err
+	}
+
 	perm := drive.Permission{
 		Role:         "owner",
 		EmailAddress: owner,
@@ -478,8 +543,8 @@ func (f *Fs) setOwner(ctx context.Context, info *drive.File, owner string) (err 
 		// extra information required for an `anyone` type.
 		Type: "user",
 	}
-	err = f.pacer.Call(func() (bool, error) {
-		_, err = f.svc.Permissions.Create(info.Id, &perm).
+	err = pacerInstance.Call(func() (bool, error) {
+		_, err = svc.Permissions.Create(info.Id, &perm).
 			SupportsAllDrives(true).
 			TransferOwnership(true).
 			// SendNotificationEmail(false). - required apparently!
@@ -509,6 +574,10 @@ type updateMetadataFn func(context.Context, *drive.File) error
 func (f *Fs) updateMetadata(ctx context.Context, updateInfo *drive.File, meta fs.Metadata, update, isFolder bool) (callback updateMetadataFn, err error) {
 	callbackFns := []updateMetadataFn{}
 	callback = func(ctx context.Context, info *drive.File) error {
+		ctx, _, err := bindAccountForWriteObject(ctx, f)
+		if err != nil {
+			return err
+		}
 		for _, fn := range callbackFns {
 			err := fn(ctx, info)
 			if err != nil {

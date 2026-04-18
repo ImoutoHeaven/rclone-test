@@ -70,12 +70,13 @@ const (
 	defaultScope                = "drive"
 	// chunkSize is the size of the chunks created during a resumable upload and should be a power of two.
 	// 1<<18 is the minimum size supported by the Google uploader, and there is no maximum.
-	minChunkSize     = fs.SizeSuffix(googleapi.MinUploadChunkSize)
-	defaultChunkSize = 8 * fs.Mebi
-	partialFields    = "id,name,size,md5Checksum,sha1Checksum,sha256Checksum,trashed,explicitlyTrashed,modifiedTime,createdTime,mimeType,parents,webViewLink,shortcutDetails,exportLinks,resourceKey"
-	listRGrouping    = 50   // number of IDs to search at once when using ListR
-	listRInputBuffer = 1000 // size of input buffer when using ListR
-	defaultXDGIcon   = "text-html"
+	minChunkSize            = fs.SizeSuffix(googleapi.MinUploadChunkSize)
+	defaultChunkSize        = 8 * fs.Mebi
+	defaultUploadDailyLimit = 750 * fs.Gibi
+	partialFields           = "id,name,size,md5Checksum,sha1Checksum,sha256Checksum,trashed,explicitlyTrashed,modifiedTime,createdTime,mimeType,parents,webViewLink,shortcutDetails,exportLinks,resourceKey"
+	listRGrouping           = 50   // number of IDs to search at once when using ListR
+	listRInputBuffer        = 1000 // size of input buffer when using ListR
+	defaultXDGIcon          = "text-html"
 )
 
 // Globals
@@ -339,6 +340,23 @@ a non root folder as its starting point.
 			Advanced:  true,
 			Sensitive: true,
 		}, {
+			Name:      "accounts_json",
+			Help:      "Absolute local file path for multi-account account entries (JSON array or JSONL).",
+			Advanced:  true,
+			Sensitive: true,
+		}, {
+			Name:     "account_selection_policy",
+			Help:     "Account selection policy for multi-account mode.",
+			Default:  "round_robin",
+			Advanced: true,
+			Examples: []fs.OptionExample{{
+				Value: "round_robin",
+				Help:  "Rotate across eligible accounts in deterministic order.",
+			}, {
+				Value: "random",
+				Help:  "Choose uniformly at random from eligible accounts.",
+			}},
+		}, {
 			Name:     "auth_owner_only",
 			Default:  false,
 			Help:     "Only consider files owned by the authenticated user.",
@@ -590,6 +608,18 @@ See: https://github.com/rclone/rclone/issues/3631
 `,
 			Advanced: true,
 		}, {
+			Name:     "sleep_on_upload_limit",
+			Default:  false,
+			Help:     "If enabled, upload operations sleep until next UTC day when daily upload budget is reached.",
+			Advanced: true,
+		}, {
+			Name:    "upload_daily_limit",
+			Default: defaultUploadDailyLimit,
+			Help: `Daily successful upload budget used with --drive-sleep-on-upload-limit.
+Examples: 750G, 750Gi, 750GiB.
+`,
+			Advanced: true,
+		}, {
 			Name:    "stop_on_upload_limit",
 			Default: false,
 			Help: `Make upload limit errors be fatal.
@@ -772,10 +802,15 @@ two accounts.
 // Options defines the configuration for this backend
 type Options struct {
 	Scope                     string               `config:"scope"`
+	Token                     string               `config:"token"`
+	ClientID                  string               `config:"client_id"`
+	ClientSecret              string               `config:"client_secret"`
 	RootFolderID              string               `config:"root_folder_id"`
 	ServiceAccountFile        string               `config:"service_account_file"`
 	ServiceAccountCredentials string               `config:"service_account_credentials"`
 	TeamDriveID               string               `config:"team_drive"`
+	AccountsJSON              string               `config:"accounts_json"`
+	AccountSelectionPolicy    string               `config:"account_selection_policy"`
 	AuthOwnerOnly             bool                 `config:"auth_owner_only"`
 	UseTrash                  bool                 `config:"use_trash"`
 	CopyShortcutContent       bool                 `config:"copy_shortcut_content"`
@@ -803,6 +838,8 @@ type Options struct {
 	PacerBurst                int                  `config:"pacer_burst"`
 	ServerSideAcrossConfigs   bool                 `config:"server_side_across_configs"`
 	DisableHTTP2              bool                 `config:"disable_http2"`
+	SleepOnUploadLimit        bool                 `config:"sleep_on_upload_limit"`
+	UploadDailyLimit          fs.SizeSuffix        `config:"upload_daily_limit"`
 	StopOnUploadLimit         bool                 `config:"stop_on_upload_limit"`
 	StopOnDownloadLimit       bool                 `config:"stop_on_download_limit"`
 	SkipShortcuts             bool                 `config:"skip_shortcuts"`
@@ -814,6 +851,101 @@ type Options struct {
 	MetadataLabels            rwChoice             `config:"metadata_labels"`
 	Enc                       encoder.MultiEncoder `config:"encoding"`
 	EnvAuth                   bool                 `config:"env_auth"`
+}
+
+type uploadBudgetState struct {
+	mu          sync.Mutex
+	dayStartUTC time.Time
+	usedBytes   int64
+}
+
+type namespaceTarget struct {
+	teamDriveID  string
+	rootFolderID string
+}
+
+type accountValidationMapper struct {
+	base         configmap.Getter
+	token        string
+	clientID     string
+	clientSecret string
+}
+
+type oauthClientResult struct {
+	client      *http.Client
+	tokenSource *oauthutil.TokenSource
+}
+
+type accountTokenSource struct {
+	index       int
+	runtime     *accountRuntime
+	tokenSource *oauthutil.TokenSource
+}
+
+type refreshMonitorTokenSource interface {
+	OnExpiry() <-chan time.Time
+	Token() (*oauth2.Token, error)
+}
+
+func (m accountValidationMapper) Get(key string) (value string, ok bool) {
+	switch key {
+	case config.ConfigToken:
+		if m.token != "" {
+			return m.token, true
+		}
+	case config.ConfigClientID:
+		if m.clientID != "" {
+			return m.clientID, true
+		}
+	case config.ConfigClientSecret:
+		if m.clientSecret != "" {
+			return m.clientSecret, true
+		}
+	}
+	if m.base == nil {
+		return "", false
+	}
+	return m.base.Get(key)
+}
+
+func (m accountValidationMapper) Set(key, value string) {}
+
+func createOAuthClientWithTokenSource(ctx context.Context, opt *Options, name string, m configmap.Mapper) (*oauthClientResult, error) {
+	result := &oauthClientResult{}
+
+	// try loading service account credentials from env variable, then from a file
+	if len(opt.ServiceAccountCredentials) == 0 && opt.ServiceAccountFile != "" {
+		loadedCreds, err := os.ReadFile(env.ShellExpand(opt.ServiceAccountFile))
+		if err != nil {
+			return nil, fmt.Errorf("error opening service account credentials file: %w", err)
+		}
+		opt.ServiceAccountCredentials = string(loadedCreds)
+	}
+	if opt.ServiceAccountCredentials != "" {
+		oAuthClient, err := getServiceAccountClient(ctx, opt, []byte(opt.ServiceAccountCredentials))
+		if err != nil {
+			return nil, fmt.Errorf("failed to create oauth client from service account: %w", err)
+		}
+		result.client = oAuthClient
+		return result, nil
+	}
+	if opt.EnvAuth {
+		scopes := driveScopes(opt.Scope)
+		oAuthClient, err := google.DefaultClient(ctx, scopes...)
+		if err != nil {
+			return nil, fmt.Errorf("failed to create client from environment: %w", err)
+		}
+		result.client = oAuthClient
+		return result, nil
+	}
+
+	oAuthClient, tokenSource, err := oauthutil.NewClientWithBaseClient(ctx, name, m, driveConfig, getClient(ctx, opt))
+	if err != nil {
+		return nil, fmt.Errorf("failed to create oauth client: %w", err)
+	}
+	result.client = oAuthClient
+	result.tokenSource = tokenSource
+	return result, nil
 }
 
 // Fs represents a remote drive server
@@ -840,6 +972,11 @@ type Fs struct {
 	dirResourceKeys  *sync.Map                    // map directory ID to resource key
 	permissionsMu    *sync.Mutex                  // protect the below
 	permissions      map[string]*drive.Permission // map permission IDs to Permissions
+	uploadBudget     uploadBudgetState
+	nowFn            func() time.Time
+	sleepFn          func(context.Context, time.Duration) error
+	accountPool      *accountPool
+	accountStore     *accountStore
 }
 
 type baseObject struct {
@@ -910,6 +1047,7 @@ func (f *Fs) shouldRetry(ctx context.Context, err error) (bool, error) {
 	if err == nil {
 		return false, nil
 	}
+	f.disableBoundRuntimeOnFatalRefresh(ctx, err)
 	if fserrors.ShouldRetry(err) {
 		return true, err
 	}
@@ -942,6 +1080,63 @@ func (f *Fs) shouldRetry(ctx context.Context, err error) (bool, error) {
 	return false, err
 }
 
+func (f *Fs) nowUTC() time.Time {
+	if f.nowFn != nil {
+		return f.nowFn().UTC()
+	}
+	return time.Now().UTC()
+}
+
+func (f *Fs) sleep(ctx context.Context, d time.Duration) error {
+	if f.sleepFn != nil {
+		return f.sleepFn(ctx, d)
+	}
+	return sleepWithContext(ctx, d)
+}
+
+func (f *Fs) disableBoundRuntimeOnFatalRefresh(ctx context.Context, err error) {
+	if f == nil || f.accountPool == nil || err == nil {
+		return
+	}
+	runtime := contextBoundRuntime(ctx)
+	if runtime != nil && !f.runtimeBelongsToPool(runtime) {
+		runtime = nil
+	}
+	if runtime == nil {
+		return
+	}
+	if runtime.disableOnFatalRefresh(err) == refreshErrorFatal {
+		fs.Errorf(f, "drive: disabling account %d after fatal token refresh failure in request path: %v", runtime.index, err)
+	}
+}
+
+func (f *Fs) shouldRetryUpload(ctx context.Context, err error, isUploadPath bool) (bool, error) {
+	reason := ""
+	if gerr, ok := err.(*googleapi.Error); ok && len(gerr.Errors) > 0 {
+		reason = gerr.Errors[0].Reason
+	}
+
+	if isUploadPath && f.opt.SleepOnUploadLimit && reason == "userRateLimitExceeded" {
+		now := f.nowUTC()
+		wake := utcDayStart(now).Add(24 * time.Hour)
+		if runtime := f.boundUploadBudgetRuntime(ctx); runtime != nil {
+			runtime.setUploadSleepUntilUTC(wake)
+		}
+		wait := wake.Sub(now)
+		if wait < 0 {
+			wait = 0
+		}
+		if wait > 0 {
+			if sleepErr := f.sleep(ctx, wait); sleepErr != nil {
+				return false, sleepErr
+			}
+		}
+		return true, err
+	}
+
+	return f.shouldRetry(ctx, err)
+}
+
 // parseParse parses a drive 'url'
 func parseDrivePath(path string) (root string, err error) {
 	root = strings.Trim(path, "/")
@@ -959,8 +1154,20 @@ func containsString(slice []string, s string) bool {
 
 // getFile returns drive.File for the ID passed and fields passed in
 func (f *Fs) getFile(ctx context.Context, ID string, fields googleapi.Field) (info *drive.File, err error) {
-	err = f.pacer.Call(func() (bool, error) {
-		info, err = f.svc.Files.Get(ID).
+	ctx, err = f.bindRuntimeForReadCall(ctx)
+	if err != nil {
+		return nil, err
+	}
+	svc, err := f.svcFor(ctx)
+	if err != nil {
+		return nil, err
+	}
+	pacerInstance, err := f.pacerFor(ctx)
+	if err != nil {
+		return nil, err
+	}
+	err = pacerInstance.Call(func() (bool, error) {
+		info, err = svc.Files.Get(ID).
 			Fields(fields).
 			SupportsAllDrives(true).
 			Context(ctx).Do()
@@ -984,6 +1191,19 @@ func (f *Fs) getRootID(ctx context.Context) (string, error) {
 //
 // Search params: https://developers.google.com/drive/search-parameters
 func (f *Fs) list(ctx context.Context, dirIDs []string, title string, directoriesOnly, filesOnly, trashedOnly, includeAll bool, fn listFn) (found bool, err error) {
+	ctx, err = f.bindRuntimeForReadCall(ctx)
+	if err != nil {
+		return false, err
+	}
+	svc, err := f.svcFor(ctx)
+	if err != nil {
+		return false, err
+	}
+	pacerInstance, err := f.pacerFor(ctx)
+	if err != nil {
+		return false, err
+	}
+
 	var query []string
 	if !includeAll {
 		q := "trashed=" + strconv.FormatBool(trashedOnly)
@@ -1074,7 +1294,7 @@ func (f *Fs) list(ctx context.Context, dirIDs []string, title string, directorie
 		queryByTime("<=", fi.ModTimeTo)
 	}
 
-	list := f.svc.Files.List()
+	list := svc.Files.List()
 	queryString := strings.Join(query, " and ")
 	if queryString != "" {
 		list.Q(queryString)
@@ -1105,7 +1325,7 @@ func (f *Fs) list(ctx context.Context, dirIDs []string, title string, directorie
 OUTER:
 	for {
 		var files *drive.FileList
-		err = f.pacer.Call(func() (bool, error) {
+		err = pacerInstance.Call(func() (bool, error) {
 			files, err = list.Fields(googleapi.Field(fields)).Context(ctx).Do()
 			return f.shouldRetry(ctx, err)
 		})
@@ -1267,36 +1487,33 @@ func getServiceAccountClient(ctx context.Context, opt *Options, credentialsData 
 }
 
 func createOAuthClient(ctx context.Context, opt *Options, name string, m configmap.Mapper) (*http.Client, error) {
-	var oAuthClient *http.Client
-	var err error
-
-	// try loading service account credentials from env variable, then from a file
-	if len(opt.ServiceAccountCredentials) == 0 && opt.ServiceAccountFile != "" {
-		loadedCreds, err := os.ReadFile(env.ShellExpand(opt.ServiceAccountFile))
-		if err != nil {
-			return nil, fmt.Errorf("error opening service account credentials file: %w", err)
-		}
-		opt.ServiceAccountCredentials = string(loadedCreds)
+	result, err := createOAuthClientWithTokenSource(ctx, opt, name, m)
+	if err != nil {
+		return nil, err
 	}
-	if opt.ServiceAccountCredentials != "" {
-		oAuthClient, err = getServiceAccountClient(ctx, opt, []byte(opt.ServiceAccountCredentials))
-		if err != nil {
-			return nil, fmt.Errorf("failed to create oauth client from service account: %w", err)
-		}
-	} else if opt.EnvAuth {
-		scopes := driveScopes(opt.Scope)
-		oAuthClient, err = google.DefaultClient(ctx, scopes...)
-		if err != nil {
-			return nil, fmt.Errorf("failed to create client from environment: %w", err)
-		}
-	} else {
-		oAuthClient, _, err = oauthutil.NewClientWithBaseClient(ctx, name, m, driveConfig, getClient(ctx, opt))
-		if err != nil {
-			return nil, fmt.Errorf("failed to create oauth client: %w", err)
-		}
+	return result.client, nil
+}
+
+type oauthClientFactory func(context.Context, *Options, string, configmap.Mapper) (*http.Client, error)
+
+func createOAuthClientForInit(ctx context.Context, opt *Options, name string, m configmap.Mapper, factory oauthClientFactory) (*http.Client, error) {
+	if !isMultiAccountMode(opt.AccountsJSON) {
+		return factory(ctx, opt, name, m)
 	}
 
-	return oAuthClient, nil
+	accounts, err := parseAccountsJSON(opt.AccountsJSON, opt)
+	if err != nil {
+		return nil, err
+	}
+
+	mapper := accountValidationMapper{
+		base:         m,
+		token:        accounts[0].tokenJSON,
+		clientID:     accounts[0].clientID,
+		clientSecret: accounts[0].clientSecret,
+	}
+
+	return factory(ctx, opt, name, mapper)
 }
 
 func checkUploadChunkSize(cs fs.SizeSuffix) error {
@@ -1321,6 +1538,545 @@ func checkUploadCutoff(cs fs.SizeSuffix) error {
 	return nil
 }
 
+func checkUploadDailyLimit(limit fs.SizeSuffix) error {
+	if limit <= 0 {
+		return fmt.Errorf("drive: upload daily limit must be > 0, got %v", limit)
+	}
+	return nil
+}
+
+func isMultiAccountMode(accountsJSON string) bool {
+	return accountsJSON != ""
+}
+
+func validateAccountsJSON(raw string) error {
+	_, err := parseAccountsJSON(raw, &Options{UploadDailyLimit: defaultUploadDailyLimit})
+	if err != nil {
+		return err
+	}
+	return nil
+}
+
+func applyAccountSelectionPolicyDefaults(opt *Options) {
+	if opt.AccountSelectionPolicy == "" {
+		opt.AccountSelectionPolicy = "round_robin"
+	}
+}
+
+func validateAccountSelectionPolicy(v string) error {
+	switch v {
+	case "", "round_robin", "random":
+		return nil
+	default:
+		return fmt.Errorf("drive: account_selection_policy must be round_robin or random")
+	}
+}
+
+func validateMultiAccountConfig(opt *Options) error {
+	err := validateAccountSelectionPolicy(opt.AccountSelectionPolicy)
+	if err != nil {
+		return err
+	}
+
+	if !isMultiAccountMode(opt.AccountsJSON) {
+		return nil
+	}
+
+	if opt.ServiceAccountFile != "" {
+		return errors.New("drive: accounts_json cannot be used with service_account_file")
+	}
+	if opt.ServiceAccountCredentials != "" {
+		return errors.New("drive: accounts_json cannot be used with service_account_credentials")
+	}
+	if opt.EnvAuth {
+		return errors.New("drive: accounts_json cannot be used with env_auth")
+	}
+
+	hasTeamDrive := strings.TrimSpace(opt.TeamDriveID) != ""
+	hasRootFolderID := strings.TrimSpace(opt.RootFolderID) != ""
+	if hasTeamDrive == hasRootFolderID {
+		return errors.New("drive: multi-account mode requires exactly one of team_drive or root_folder_id")
+	}
+
+	err = validateAccountsJSON(opt.AccountsJSON)
+	if err != nil {
+		return err
+	}
+
+	return nil
+}
+
+func namespaceTargetFromOptions(opt *Options) namespaceTarget {
+	return namespaceTarget{
+		teamDriveID:  strings.TrimSpace(opt.TeamDriveID),
+		rootFolderID: strings.TrimSpace(opt.RootFolderID),
+	}
+}
+
+func namespaceAccessCheckerWithService(svc *drive.Service) func(context.Context, namespaceTarget) error {
+	return func(ctx context.Context, namespace namespaceTarget) error {
+		if svc == nil {
+			return errors.New("missing drive service")
+		}
+
+		if namespace.teamDriveID != "" {
+			_, err := svc.Drives.Get(namespace.teamDriveID).Fields("id").Context(ctx).Do()
+			if err != nil {
+				return fmt.Errorf("failed to access team_drive %q: %w", namespace.teamDriveID, err)
+			}
+			return nil
+		}
+
+		if namespace.rootFolderID == "" {
+			return errors.New("missing root_folder_id namespace target")
+		}
+
+		_, err := svc.Files.Get(namespace.rootFolderID).Fields("id").SupportsAllDrives(true).Context(ctx).Do()
+		if err != nil {
+			return fmt.Errorf("failed to access root_folder_id %q: %w", namespace.rootFolderID, err)
+		}
+		return nil
+	}
+}
+
+func buildNamespaceValidationPool(ctx context.Context, name string, opt *Options, baseMapper configmap.Mapper) (*accountPool, error) {
+	accounts, err := parseAccountsJSON(opt.AccountsJSON, opt)
+	if err != nil {
+		return nil, err
+	}
+
+	runtimes := make([]*accountRuntime, 0, len(accounts))
+	for index, account := range accounts {
+		mapper := accountValidationMapper{
+			base:         baseMapper,
+			token:        account.tokenJSON,
+			clientID:     account.clientID,
+			clientSecret: account.clientSecret,
+		}
+
+		oAuthClient, err := createOAuthClient(ctx, opt, name, mapper)
+		if err != nil {
+			return nil, fmt.Errorf("drive: failed when making oauth client for account %d: %w", index, err)
+		}
+
+		svc, err := drive.NewService(context.Background(), option.WithHTTPClient(oAuthClient))
+		if err != nil {
+			return nil, fmt.Errorf("drive: couldn't create Drive client for account %d: %w", index, err)
+		}
+
+		var v2Svc *drive_v2.Service
+		if opt.V2DownloadMinSize >= 0 {
+			v2Svc, err = drive_v2.NewService(context.Background(), option.WithHTTPClient(oAuthClient))
+			if err != nil {
+				return nil, fmt.Errorf("drive: couldn't create Drive v2 client for account %d: %w", index, err)
+			}
+		}
+
+		runtime := newAccountRuntime(
+			index,
+			account.name,
+			oAuthClient,
+			svc,
+			v2Svc,
+			fs.NewPacer(ctx, pacer.NewGoogleDrive(pacer.MinSleep(opt.PacerMinSleep), pacer.Burst(opt.PacerBurst))),
+			account.uploadDailyLimit,
+		)
+		runtime.namespaceAccessCheck = namespaceAccessCheckerWithService(svc)
+		runtimes = append(runtimes, runtime)
+	}
+
+	return newAccountPool(opt.AccountSelectionPolicy, runtimes), nil
+}
+
+func buildMultiAccountRuntimeState(ctx context.Context, name string, opt *Options, baseMapper configmap.Mapper) (*accountPool, *accountStore, []accountTokenSource, error) {
+	accounts, err := parseAccountsJSON(opt.AccountsJSON, opt)
+	if err != nil {
+		return nil, nil, nil, err
+	}
+
+	store := newAccountStore(accounts, func(accountsJSON string) error {
+		return persistAccountsJSONFile(opt.AccountsJSON, accountsJSON)
+	})
+
+	shutdownStoreOnError := func() {
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		_ = store.shutdown(shutdownCtx)
+		cancel()
+	}
+
+	runtimes := make([]*accountRuntime, 0, len(accounts))
+	tokenSources := make([]accountTokenSource, 0, len(accounts))
+	for _, account := range accounts {
+		mapper := accountMapper{
+			store: store,
+			base:  baseMapper,
+			index: account.index,
+		}
+
+		oAuthResult, err := createOAuthClientWithTokenSource(ctx, opt, name, mapper)
+		if err != nil {
+			shutdownStoreOnError()
+			return nil, nil, nil, fmt.Errorf("drive: failed when making oauth client for account %d: %w", account.index, err)
+		}
+
+		svc, err := drive.NewService(context.Background(), option.WithHTTPClient(oAuthResult.client))
+		if err != nil {
+			shutdownStoreOnError()
+			return nil, nil, nil, fmt.Errorf("drive: couldn't create Drive client for account %d: %w", account.index, err)
+		}
+
+		var v2Svc *drive_v2.Service
+		if opt.V2DownloadMinSize >= 0 {
+			v2Svc, err = drive_v2.NewService(context.Background(), option.WithHTTPClient(oAuthResult.client))
+			if err != nil {
+				shutdownStoreOnError()
+				return nil, nil, nil, fmt.Errorf("drive: couldn't create Drive v2 client for account %d: %w", account.index, err)
+			}
+		}
+
+		runtime := newAccountRuntime(
+			account.index,
+			account.name,
+			oAuthResult.client,
+			svc,
+			v2Svc,
+			fs.NewPacer(ctx, pacer.NewGoogleDrive(pacer.MinSleep(opt.PacerMinSleep), pacer.Burst(opt.PacerBurst))),
+			account.uploadDailyLimit,
+		)
+		runtime.namespaceAccessCheck = namespaceAccessCheckerWithService(svc)
+
+		if oAuthResult.tokenSource != nil {
+			tokenSources = append(tokenSources, accountTokenSource{index: account.index, runtime: runtime, tokenSource: oAuthResult.tokenSource})
+		}
+
+		runtimes = append(runtimes, runtime)
+	}
+
+	return newAccountPool(opt.AccountSelectionPolicy, runtimes), store, tokenSources, nil
+}
+
+func refreshMonitorBackoff(attempt int) time.Duration {
+	if attempt < 1 {
+		attempt = 1
+	}
+	if attempt > 8 {
+		attempt = 8
+	}
+	return time.Duration(1<<(attempt-1)) * 100 * time.Millisecond
+}
+
+func monitorAccountRefreshToken(ctx context.Context, accountIndex int, runtime *accountRuntime, ts refreshMonitorTokenSource, sleeper func(context.Context, time.Duration) error) {
+	if runtime == nil || ts == nil {
+		return
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if sleeper == nil {
+		sleeper = sleepContext
+	}
+
+	for {
+		expiryCh := ts.OnExpiry()
+		if expiryCh == nil {
+			return
+		}
+
+		var expirySignal time.Time
+		select {
+		case <-ctx.Done():
+			return
+		case signal, ok := <-expiryCh:
+			if !ok {
+				return
+			}
+			expirySignal = signal
+		}
+
+		if runtime.isDisabled() {
+			return
+		}
+
+		now := time.Now()
+		if expirySignal.After(now) {
+			if err := sleeper(ctx, expirySignal.Sub(now)); err != nil {
+				return
+			}
+		}
+		if runtime.isDisabled() {
+			return
+		}
+
+		retryAttempt := 0
+		for {
+			_, refreshErr := ts.Token()
+			switch runtime.disableOnFatalRefresh(refreshErr) {
+			case refreshErrorFatal:
+				fs.Errorf(nil, "drive: disabling account %d after fatal token refresh failure: %v", accountIndex, refreshErr)
+				return
+			case refreshErrorTransient:
+				retryAttempt++
+				if err := sleeper(ctx, refreshMonitorBackoff(retryAttempt)); err != nil {
+					return
+				}
+				continue
+			default:
+				// token refreshed successfully, or non-refresh error surfaced.
+			}
+			break
+		}
+	}
+}
+
+func validateNamespaceAccessForAllAccounts(ctx context.Context, pool *accountPool, namespace namespaceTarget) error {
+	if pool == nil {
+		return errors.New("drive: account pool must not be nil")
+	}
+	if len(pool.accounts) == 0 {
+		return errors.New("drive: account pool must contain at least one account")
+	}
+
+	for listIndex, runtime := range pool.accounts {
+		if runtime == nil {
+			return fmt.Errorf("drive: account runtime at list index %d is nil", listIndex)
+		}
+		if runtime.namespaceAccessCheck == nil {
+			return fmt.Errorf("drive: account %d missing namespace access checker", runtime.index)
+		}
+		if err := runtime.namespaceAccessCheck(ctx, namespace); err != nil {
+			return fmt.Errorf("drive: account %d cannot access configured namespace: %w", runtime.index, err)
+		}
+	}
+
+	return nil
+}
+
+func (f *Fs) bindRuntimeForReadCall(ctx context.Context) (context.Context, error) {
+	ctx = contextOrBackground(ctx)
+	if f == nil || f.accountPool == nil {
+		return ctx, nil
+	}
+	if runtime := contextBoundRuntime(ctx); runtime != nil && f.runtimeBelongsToPool(runtime) {
+		return ctx, nil
+	}
+	boundCtx, _, err := bindAccountForReadCall(ctx, f)
+	if err != nil {
+		return ctx, err
+	}
+	return boundCtx, nil
+}
+
+func (f *Fs) metadataRuntimeFS(ctx context.Context) (*Fs, error) {
+	svc, err := f.svcFor(ctx)
+	if err != nil {
+		return nil, err
+	}
+	pacerInstance, err := f.pacerFor(ctx)
+	if err != nil {
+		return nil, err
+	}
+	bound := *f
+	bound.svc = svc
+	bound.pacer = pacerInstance
+	return &bound, nil
+}
+
+func (f *Fs) svcFor(ctx context.Context) (*drive.Service, error) {
+	runtime, err := runtimeFromContext(ctx, f)
+	if err != nil {
+		return nil, err
+	}
+	if runtime != nil && runtime.svc != nil {
+		return runtime.svc, nil
+	}
+	if f.svc == nil {
+		return nil, errors.New("drive: missing drive service")
+	}
+	return f.svc, nil
+}
+
+func (f *Fs) v2SvcFor(ctx context.Context) (*drive_v2.Service, error) {
+	runtime, err := runtimeFromContext(ctx, f)
+	if err != nil {
+		return nil, err
+	}
+	if runtime != nil && runtime.v2Svc != nil {
+		return runtime.v2Svc, nil
+	}
+	if f.v2Svc == nil {
+		return nil, errors.New("drive: missing drive v2 service")
+	}
+	return f.v2Svc, nil
+}
+
+func (f *Fs) clientFor(ctx context.Context) (*http.Client, error) {
+	runtime, err := runtimeFromContext(ctx, f)
+	if err != nil {
+		return nil, err
+	}
+	if runtime != nil && runtime.client != nil {
+		return runtime.client, nil
+	}
+	if f.client == nil {
+		return nil, errors.New("drive: missing drive client")
+	}
+	return f.client, nil
+}
+
+func (f *Fs) pacerFor(ctx context.Context) (*fs.Pacer, error) {
+	runtime, err := runtimeFromContext(ctx, f)
+	if err != nil {
+		return nil, err
+	}
+	if runtime != nil && runtime.pacer != nil {
+		return runtime.pacer, nil
+	}
+	if f.pacer == nil {
+		return nil, errors.New("drive: missing drive pacer")
+	}
+	return f.pacer, nil
+}
+
+func utcDayStart(now time.Time) time.Time {
+	u := now.UTC()
+	y, m, d := u.Date()
+	return time.Date(y, m, d, 0, 0, 0, 0, time.UTC)
+}
+
+func durationUntilNextUTCDay(now time.Time) time.Duration {
+	start := utcDayStart(now)
+	next := start.Add(24 * time.Hour)
+	d := next.Sub(now.UTC())
+	if d < 0 {
+		return 0
+	}
+	return d
+}
+
+func (f *Fs) rolloverUploadBudgetLocked(now time.Time) {
+	start := utcDayStart(now)
+	if f.uploadBudget.dayStartUTC.IsZero() || !f.uploadBudget.dayStartUTC.Equal(start) {
+		f.uploadBudget.dayStartUTC = start
+		f.uploadBudget.usedBytes = 0
+	}
+}
+
+func rolloverAccountUploadBudgetLocked(runtime *accountRuntime, now time.Time) {
+	if runtime == nil {
+		return
+	}
+	start := utcDayStart(now)
+	if runtime.state.dayStartUTC.IsZero() || !runtime.state.dayStartUTC.Equal(start) {
+		runtime.state.dayStartUTC = start
+		runtime.state.usedBytes = 0
+	}
+}
+
+func (f *Fs) boundUploadBudgetRuntime(ctx context.Context) *accountRuntime {
+	if f == nil || f.accountPool == nil {
+		return nil
+	}
+	return contextBoundRuntime(ctx)
+}
+
+func (f *Fs) noteSuccessfulUploadBytes(ctx context.Context, now time.Time, n int64) {
+	if !f.opt.SleepOnUploadLimit || n <= 0 {
+		return
+	}
+	runtime := f.boundUploadBudgetRuntime(ctx)
+	if runtime != nil {
+		runtime.state.mu.Lock()
+		rolloverAccountUploadBudgetLocked(runtime, now)
+		runtime.state.usedBytes += n
+		runtime.state.mu.Unlock()
+		return
+	}
+	f.uploadBudget.mu.Lock()
+	defer f.uploadBudget.mu.Unlock()
+	f.rolloverUploadBudgetLocked(now)
+	f.uploadBudget.usedBytes += n
+}
+
+func (f *Fs) waitForUploadBudget(ctx context.Context, want int64, sleeper func(time.Duration) error) error {
+	if !f.opt.SleepOnUploadLimit || want <= 0 {
+		return nil
+	}
+	runtime := f.boundUploadBudgetRuntime(ctx)
+	if runtime != nil {
+		limit := int64(runtime.uploadDailyLimit)
+		if limit <= 0 {
+			limit = int64(f.opt.UploadDailyLimit)
+		}
+		if limit <= 0 {
+			return nil
+		}
+		overSized := want > limit
+		oversizedWaitedForRollover := false
+		for {
+			now := time.Now().UTC()
+			runtime.state.mu.Lock()
+			rolloverAccountUploadBudgetLocked(runtime, now)
+			used := runtime.state.usedBytes
+			if (!overSized && used+want <= limit) || (overSized && oversizedWaitedForRollover) {
+				runtime.state.mu.Unlock()
+				return nil
+			}
+			wake := utcDayStart(now).Add(24 * time.Hour)
+			wait := wake.Sub(now)
+			if wait < 0 {
+				wait = 0
+			}
+			runtime.state.uploadSleepUntilUTC = wake
+			runtime.state.mu.Unlock()
+			if wait <= 0 {
+				continue
+			}
+			if err := sleeper(wait); err != nil {
+				return err
+			}
+			if overSized {
+				oversizedWaitedForRollover = true
+			}
+		}
+	}
+
+	overSized := want > int64(f.opt.UploadDailyLimit)
+	oversizedWaitedForRollover := false
+	for {
+		now := time.Now().UTC()
+		f.uploadBudget.mu.Lock()
+		f.rolloverUploadBudgetLocked(now)
+		used := f.uploadBudget.usedBytes
+		limit := int64(f.opt.UploadDailyLimit)
+		if (!overSized && used+want <= limit) || (overSized && oversizedWaitedForRollover) {
+			f.uploadBudget.mu.Unlock()
+			return nil
+		}
+		wait := durationUntilNextUTCDay(now)
+		f.uploadBudget.mu.Unlock()
+		if wait <= 0 {
+			continue
+		}
+		if err := sleeper(wait); err != nil {
+			return err
+		}
+		if overSized {
+			oversizedWaitedForRollover = true
+		}
+	}
+}
+
+func sleepWithContext(ctx context.Context, d time.Duration) error {
+	t := time.NewTimer(d)
+	defer t.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-t.C:
+		return nil
+	}
+}
+
 func (f *Fs) setUploadCutoff(cs fs.SizeSuffix) (old fs.SizeSuffix, err error) {
 	err = checkUploadCutoff(cs)
 	if err == nil {
@@ -1340,6 +2096,11 @@ func newFs(ctx context.Context, name, path string, m configmap.Mapper) (*Fs, err
 	if err != nil {
 		return nil, err
 	}
+	applyAccountSelectionPolicyDefaults(opt)
+	err = validateMultiAccountConfig(opt)
+	if err != nil {
+		return nil, err
+	}
 	err = checkUploadCutoff(opt.UploadCutoff)
 	if err != nil {
 		return nil, fmt.Errorf("drive: upload cutoff: %w", err)
@@ -1348,8 +2109,12 @@ func newFs(ctx context.Context, name, path string, m configmap.Mapper) (*Fs, err
 	if err != nil {
 		return nil, fmt.Errorf("drive: chunk size: %w", err)
 	}
+	err = checkUploadDailyLimit(opt.UploadDailyLimit)
+	if err != nil {
+		return nil, err
+	}
 
-	oAuthClient, err := createOAuthClient(ctx, opt, name, m)
+	oAuthClient, err := createOAuthClientForInit(ctx, opt, name, m, createOAuthClient)
 	if err != nil {
 		return nil, fmt.Errorf("drive: failed when making oauth client: %w", err)
 	}
@@ -1373,6 +2138,10 @@ func newFs(ctx context.Context, name, path string, m configmap.Mapper) (*Fs, err
 		dirResourceKeys: new(sync.Map),
 		permissionsMu:   new(sync.Mutex),
 		permissions:     make(map[string]*drive.Permission),
+		uploadBudget: uploadBudgetState{
+			dayStartUTC: utcDayStart(time.Now()),
+			usedBytes:   0,
+		},
 	}
 	f.isTeamDrive = opt.TeamDriveID != ""
 	f.features = (&fs.Features{
@@ -1440,6 +2209,25 @@ func NewFs(ctx context.Context, name, path string, m configmap.Mapper) (fs.Fs, e
 		fs.Debugf(f, "'root_folder_id = %s' - save this in the config to speed up startup", rootID)
 	}
 
+	if isMultiAccountMode(f.opt.AccountsJSON) {
+		pool, store, tokenSources, err := buildMultiAccountRuntimeState(ctx, f.name, &f.opt, m)
+		if err != nil {
+			return nil, err
+		}
+		err = validateNamespaceAccessForAllAccounts(ctx, pool, namespaceTargetFromOptions(&f.opt))
+		if err != nil {
+			shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			_ = store.shutdown(shutdownCtx)
+			cancel()
+			return nil, err
+		}
+		f.accountPool = pool
+		f.accountStore = store
+		for _, source := range tokenSources {
+			go monitorAccountRefreshToken(context.Background(), source.index, source.runtime, source.tokenSource, nil)
+		}
+	}
+
 	f.dirCache = dircache.New(f.root, f.rootFolderID, f)
 
 	// If resource key is set then cache it for the root folder id
@@ -1469,25 +2257,25 @@ func NewFs(ctx context.Context, name, path string, m configmap.Mapper) (fs.Fs, e
 	if err != nil {
 		// Assume it is a file
 		newRoot, remote := dircache.SplitPath(f.root)
-		tempF := *f
-		tempF.dirCache = dircache.New(newRoot, f.rootFolderID, &tempF)
-		tempF.root = newRoot
+		originalRoot := f.root
+		originalDirCache := f.dirCache
+		f.root = newRoot
+		f.dirCache = dircache.New(newRoot, f.rootFolderID, f)
 		// Make new Fs which is the parent
-		err = tempF.dirCache.FindRoot(ctx, false)
+		err = f.dirCache.FindRoot(ctx, false)
 		if err != nil {
 			// No root so return old f
+			f.root = originalRoot
+			f.dirCache = originalDirCache
 			return f, nil
 		}
-		_, err := tempF.NewObject(ctx, remote)
+		_, err = f.NewObject(ctx, remote)
 		if err != nil {
 			// unable to list folder so return old f
+			f.root = originalRoot
+			f.dirCache = originalDirCache
 			return f, nil
 		}
-		// XXX: update the old f here instead of returning tempF, since
-		// `features` were already filled with functions having *f as a receiver.
-		// See https://github.com/rclone/rclone/issues/2182
-		f.dirCache = tempF.dirCache
-		f.root = tempF.root
 		return f, fs.ErrorIsFile
 	}
 	// fmt.Printf("Root id %s", f.dirCache.RootID())
@@ -1552,8 +2340,12 @@ func (f *Fs) newRegularObject(ctx context.Context, remote string, info *drive.Fi
 			info.Sha256Checksum = ""
 		}
 	}
+	svc, err := f.svcFor(ctx)
+	if err != nil {
+		return nil, err
+	}
 	o := &Object{
-		url:        fmt.Sprintf("%sfiles/%s?alt=media", f.svc.BasePath, actualID(info.Id)),
+		url:        fmt.Sprintf("%sfiles/%s?alt=media", svc.BasePath, actualID(info.Id)),
 		md5sum:     strings.ToLower(info.Md5Checksum),
 		sha1sum:    strings.ToLower(info.Sha1Checksum),
 		sha256sum:  strings.ToLower(info.Sha256Checksum),
@@ -1736,6 +2528,23 @@ func (f *Fs) FindLeaf(ctx context.Context, pathID, leaf string) (pathIDOut strin
 
 // createDir makes a directory with pathID as parent and name leaf with optional metadata
 func (f *Fs) createDir(ctx context.Context, pathID, leaf string, metadata fs.Metadata) (info *drive.File, err error) {
+	ctx, _, err = bindAccountForWriteObject(ctx, f)
+	if err != nil {
+		return nil, err
+	}
+	svc, err := f.svcFor(ctx)
+	if err != nil {
+		return nil, err
+	}
+	pacerInstance, err := f.pacerFor(ctx)
+	if err != nil {
+		return nil, err
+	}
+	metadataFS, err := f.metadataRuntimeFS(ctx)
+	if err != nil {
+		return nil, err
+	}
+
 	leaf = f.opt.Enc.FromStandardName(leaf)
 	pathID = actualID(pathID)
 	createInfo := &drive.File{
@@ -1745,13 +2554,13 @@ func (f *Fs) createDir(ctx context.Context, pathID, leaf string, metadata fs.Met
 	}
 	var updateMetadata updateMetadataFn
 	if len(metadata) > 0 {
-		updateMetadata, err = f.updateMetadata(ctx, createInfo, metadata, true, true)
+		updateMetadata, err = metadataFS.updateMetadata(ctx, createInfo, metadata, true, true)
 		if err != nil {
 			return nil, fmt.Errorf("create dir: failed to update metadata: %w", err)
 		}
 	}
-	err = f.pacer.Call(func() (bool, error) {
-		info, err = f.svc.Files.Create(createInfo).
+	err = pacerInstance.Call(func() (bool, error) {
+		info, err = svc.Files.Create(createInfo).
 			Fields(f.getFileFields(ctx)).
 			SupportsAllDrives(true).
 			Context(ctx).Do()
@@ -1771,17 +2580,34 @@ func (f *Fs) createDir(ctx context.Context, pathID, leaf string, metadata fs.Met
 
 // updateDir updates an existing a directory with the metadata passed in
 func (f *Fs) updateDir(ctx context.Context, dirID string, metadata fs.Metadata) (info *drive.File, err error) {
+	ctx, _, err = bindAccountForWriteObject(ctx, f)
+	if err != nil {
+		return nil, err
+	}
+	svc, err := f.svcFor(ctx)
+	if err != nil {
+		return nil, err
+	}
+	pacerInstance, err := f.pacerFor(ctx)
+	if err != nil {
+		return nil, err
+	}
+	metadataFS, err := f.metadataRuntimeFS(ctx)
+	if err != nil {
+		return nil, err
+	}
+
 	if len(metadata) == 0 {
 		return f.getFile(ctx, dirID, f.getFileFields(ctx))
 	}
 	dirID = actualID(dirID)
 	updateInfo := &drive.File{}
-	updateMetadata, err := f.updateMetadata(ctx, updateInfo, metadata, true, true)
+	updateMetadata, err := metadataFS.updateMetadata(ctx, updateInfo, metadata, true, true)
 	if err != nil {
 		return nil, fmt.Errorf("update dir: failed to update metadata from source object: %w", err)
 	}
-	err = f.pacer.Call(func() (bool, error) {
-		info, err = f.svc.Files.Update(dirID, updateInfo).
+	err = pacerInstance.Call(func() (bool, error) {
+		info, err = svc.Files.Update(dirID, updateInfo).
 			Fields(f.getFileFields(ctx)).
 			SupportsAllDrives(true).
 			Context(ctx).Do()
@@ -1836,10 +2662,31 @@ func linkTemplate(mt string) *template.Template {
 
 func (f *Fs) fetchFormats(ctx context.Context) {
 	fetchFormatsOnce.Do(func() {
+		ctx, err := f.bindRuntimeForReadCall(ctx)
+		if err != nil {
+			fs.Errorf(f, "Failed to bind read account for format discovery: %v", err)
+			_exportFormats = map[string][]string{}
+			_importFormats = map[string][]string{}
+			return
+		}
+		svc, err := f.svcFor(ctx)
+		if err != nil {
+			fs.Errorf(f, "Failed to resolve Drive service for format discovery: %v", err)
+			_exportFormats = map[string][]string{}
+			_importFormats = map[string][]string{}
+			return
+		}
+		pacerInstance, err := f.pacerFor(ctx)
+		if err != nil {
+			fs.Errorf(f, "Failed to resolve Drive pacer for format discovery: %v", err)
+			_exportFormats = map[string][]string{}
+			_importFormats = map[string][]string{}
+			return
+		}
+
 		var about *drive.About
-		var err error
-		err = f.pacer.Call(func() (bool, error) {
-			about, err = f.svc.About.Get().
+		err = pacerInstance.Call(func() (bool, error) {
+			about, err = svc.About.Get().
 				Fields("exportFormats,importFormats").
 				Context(ctx).Do()
 			return f.shouldRetry(ctx, err)
@@ -2478,6 +3325,19 @@ func (f *Fs) PutStream(ctx context.Context, in io.Reader, src fs.ObjectInfo, opt
 // This will create a duplicate if we upload a new file without
 // checking to see if there is one already - use Put() for that.
 func (f *Fs) PutUnchecked(ctx context.Context, in io.Reader, src fs.ObjectInfo, options ...fs.OpenOption) (fs.Object, error) {
+	ctx, _, err := bindAccountForWriteObject(ctx, f)
+	if err != nil {
+		return nil, err
+	}
+	svc, err := f.svcFor(ctx)
+	if err != nil {
+		return nil, err
+	}
+	pacerInstance, err := f.pacerFor(ctx)
+	if err != nil {
+		return nil, err
+	}
+
 	remote := src.Remote()
 	size := src.Size()
 	modTime := src.ModTime(ctx)
@@ -2511,27 +3371,40 @@ func (f *Fs) PutUnchecked(ctx context.Context, in io.Reader, src fs.ObjectInfo, 
 	} else {
 		createInfo.MimeType = fs.MimeTypeFromName(remote)
 	}
-	updateMetadata, err := f.fetchAndUpdateMetadata(ctx, src, options, createInfo, false)
+	metadataFS, err := f.metadataRuntimeFS(ctx)
+	if err != nil {
+		return nil, err
+	}
+	updateMetadata, err := metadataFS.fetchAndUpdateMetadata(ctx, src, options, createInfo, false)
 	if err != nil {
 		return nil, err
 	}
 
 	var info *drive.File
 	if size >= 0 && size < int64(f.opt.UploadCutoff) {
+		if f.opt.SleepOnUploadLimit && size > 0 {
+			err = f.waitForUploadBudget(ctx, size, func(d time.Duration) error {
+				return sleepWithContext(ctx, d)
+			})
+			if err != nil {
+				return nil, err
+			}
+		}
 		// Make the API request to upload metadata and file data.
 		// Don't retry, return a retry error instead
-		err = f.pacer.CallNoRetry(func() (bool, error) {
-			info, err = f.svc.Files.Create(createInfo).
+		err = pacerInstance.CallNoRetry(func() (bool, error) {
+			info, err = svc.Files.Create(createInfo).
 				Media(in, googleapi.ContentType(srcMimeType), googleapi.ChunkSize(0)).
 				Fields(partialFields).
 				SupportsAllDrives(true).
 				KeepRevisionForever(f.opt.KeepRevisionForever).
 				Context(ctx).Do()
-			return f.shouldRetry(ctx, err)
+			return f.shouldRetryUpload(ctx, err, true)
 		})
 		if err != nil {
 			return nil, err
 		}
+		f.noteSuccessfulUploadBytes(ctx, time.Now(), size)
 	} else {
 		// Upload the file in chunks
 		info, err = f.Upload(ctx, in, size, srcMimeType, "", remote, createInfo)
@@ -2578,15 +3451,27 @@ func (f *Fs) MergeDirs(ctx context.Context, dirs []fs.Directory) error {
 		// move them into place
 		for _, info := range infos {
 			fs.Infof(srcDir, "merging %q", info.Name)
+			moveCtx, _, err := bindAccountForWriteObject(ctx, f)
+			if err != nil {
+				return fmt.Errorf("MergeDirs bind failed on %q in %v: %w", info.Name, srcDir, err)
+			}
+			svc, err := f.svcFor(moveCtx)
+			if err != nil {
+				return fmt.Errorf("MergeDirs service lookup failed on %q in %v: %w", info.Name, srcDir, err)
+			}
+			pacerInstance, err := f.pacerFor(moveCtx)
+			if err != nil {
+				return fmt.Errorf("MergeDirs pacer lookup failed on %q in %v: %w", info.Name, srcDir, err)
+			}
 			// Move the file into the destination
-			err = f.pacer.Call(func() (bool, error) {
-				_, err = f.svc.Files.Update(info.Id, nil).
+			err = pacerInstance.Call(func() (bool, error) {
+				_, err = svc.Files.Update(info.Id, nil).
 					RemoveParents(srcDir.ID()).
 					AddParents(dstDir.ID()).
 					Fields("").
 					SupportsAllDrives(true).
-					Context(ctx).Do()
-				return f.shouldRetry(ctx, err)
+					Context(moveCtx).Do()
+				return f.shouldRetry(moveCtx, err)
 			})
 			if err != nil {
 				return fmt.Errorf("MergeDirs move failed on %q in %v: %w", info.Name, srcDir, err)
@@ -2663,18 +3548,31 @@ func (f *Fs) DirSetModTime(ctx context.Context, dir string, modTime time.Time) e
 
 // delete a file or directory unconditionally by ID
 func (f *Fs) delete(ctx context.Context, id string, useTrash bool) error {
-	return f.pacer.Call(func() (bool, error) {
+	ctx, _, err := bindAccountForWriteObject(ctx, f)
+	if err != nil {
+		return err
+	}
+	svc, err := f.svcFor(ctx)
+	if err != nil {
+		return err
+	}
+	pacerInstance, err := f.pacerFor(ctx)
+	if err != nil {
+		return err
+	}
+
+	return pacerInstance.Call(func() (bool, error) {
 		var err error
 		if useTrash {
 			info := drive.File{
 				Trashed: true,
 			}
-			_, err = f.svc.Files.Update(id, &info).
+			_, err = svc.Files.Update(id, &info).
 				Fields("").
 				SupportsAllDrives(true).
 				Context(ctx).Do()
 		} else {
-			err = f.svc.Files.Delete(id).
+			err = svc.Files.Delete(id).
 				Fields("").
 				SupportsAllDrives(true).
 				Context(ctx).Do()
@@ -2755,6 +3653,23 @@ func (f *Fs) Precision() time.Duration {
 //
 // If it isn't possible then return fs.ErrorCantCopy
 func (f *Fs) Copy(ctx context.Context, src fs.Object, remote string) (fs.Object, error) {
+	ctx, _, err := bindAccountForWriteObject(ctx, f)
+	if err != nil {
+		return nil, err
+	}
+	svc, err := f.svcFor(ctx)
+	if err != nil {
+		return nil, err
+	}
+	pacerInstance, err := f.pacerFor(ctx)
+	if err != nil {
+		return nil, err
+	}
+	metadataFS, err := f.metadataRuntimeFS(ctx)
+	if err != nil {
+		return nil, err
+	}
+
 	var srcObj *baseObject
 	ext := ""
 	isDoc := false
@@ -2805,7 +3720,7 @@ func (f *Fs) Copy(ctx context.Context, src fs.Object, remote string) (fs.Object,
 	}
 
 	// Adjust metadata if required
-	updateMetadata, err := f.fetchAndUpdateMetadata(ctx, src, fs.MetadataAsOpenOptions(ctx), createInfo, false)
+	updateMetadata, err := metadataFS.fetchAndUpdateMetadata(ctx, src, fs.MetadataAsOpenOptions(ctx), createInfo, false)
 	if err != nil {
 		return nil, err
 	}
@@ -2821,8 +3736,8 @@ func (f *Fs) Copy(ctx context.Context, src fs.Object, remote string) (fs.Object,
 	}
 
 	var info *drive.File
-	err = f.pacer.Call(func() (bool, error) {
-		copy := f.svc.Files.Copy(id, createInfo).
+	err = pacerInstance.Call(func() (bool, error) {
+		copy := svc.Files.Copy(id, createInfo).
 			Fields(f.getFileFields(ctx)).
 			SupportsAllDrives(true).
 			KeepRevisionForever(f.opt.KeepRevisionForever)
@@ -2930,8 +3845,20 @@ func (f *Fs) CleanUp(ctx context.Context) error {
 		_, err = f.cleanupTeamDrive(ctx, "", directoryID)
 		return err
 	}
-	err := f.pacer.Call(func() (bool, error) {
-		err := f.svc.Files.EmptyTrash().Context(ctx).Do()
+	ctx, _, err := bindAccountForWriteObject(ctx, f)
+	if err != nil {
+		return err
+	}
+	svc, err := f.svcFor(ctx)
+	if err != nil {
+		return err
+	}
+	pacerInstance, err := f.pacerFor(ctx)
+	if err != nil {
+		return err
+	}
+	err = pacerInstance.Call(func() (bool, error) {
+		err := svc.Files.EmptyTrash().Context(ctx).Do()
 		return f.shouldRetry(ctx, err)
 	})
 	if err != nil {
@@ -2946,9 +3873,21 @@ func (f *Fs) teamDriveOK(ctx context.Context) (err error) {
 	if !f.isTeamDrive {
 		return nil
 	}
+	ctx, err = f.bindRuntimeForReadCall(ctx)
+	if err != nil {
+		return err
+	}
+	svc, err := f.svcFor(ctx)
+	if err != nil {
+		return err
+	}
+	pacerInstance, err := f.pacerFor(ctx)
+	if err != nil {
+		return err
+	}
 	var td *drive.Drive
-	err = f.pacer.Call(func() (bool, error) {
-		td, err = f.svc.Drives.Get(f.opt.TeamDriveID).Fields("name,id,capabilities,createdTime,restrictions").Context(ctx).Do()
+	err = pacerInstance.Call(func() (bool, error) {
+		td, err = svc.Drives.Get(f.opt.TeamDriveID).Fields("name,id,capabilities,createdTime,restrictions").Context(ctx).Do()
 		return f.shouldRetry(ctx, err)
 	})
 	if err != nil {
@@ -2968,10 +3907,21 @@ func (f *Fs) About(ctx context.Context) (*fs.Usage, error) {
 		// Teamdrives don't appear to have a usage API so just return empty
 		return &fs.Usage{}, nil
 	}
+	ctx, err := f.bindRuntimeForReadCall(ctx)
+	if err != nil {
+		return nil, err
+	}
+	svc, err := f.svcFor(ctx)
+	if err != nil {
+		return nil, err
+	}
+	pacerInstance, err := f.pacerFor(ctx)
+	if err != nil {
+		return nil, err
+	}
 	var about *drive.About
-	var err error
-	err = f.pacer.Call(func() (bool, error) {
-		about, err = f.svc.About.Get().Fields("storageQuota").Context(ctx).Do()
+	err = pacerInstance.Call(func() (bool, error) {
+		about, err = svc.About.Get().Fields("storageQuota").Context(ctx).Do()
 		return f.shouldRetry(ctx, err)
 	})
 	if err != nil {
@@ -3000,6 +3950,23 @@ func (f *Fs) About(ctx context.Context) (*fs.Usage, error) {
 //
 // If it isn't possible then return fs.ErrorCantMove
 func (f *Fs) Move(ctx context.Context, src fs.Object, remote string) (fs.Object, error) {
+	ctx, _, err := bindAccountForWriteObject(ctx, f)
+	if err != nil {
+		return nil, err
+	}
+	svc, err := f.svcFor(ctx)
+	if err != nil {
+		return nil, err
+	}
+	pacerInstance, err := f.pacerFor(ctx)
+	if err != nil {
+		return nil, err
+	}
+	metadataFS, err := f.metadataRuntimeFS(ctx)
+	if err != nil {
+		return nil, err
+	}
+
 	var srcObj *baseObject
 	ext := ""
 	switch src := src.(type) {
@@ -3037,15 +4004,15 @@ func (f *Fs) Move(ctx context.Context, src fs.Object, remote string) (fs.Object,
 	dstInfo.Parents = nil
 
 	// Adjust metadata if required
-	updateMetadata, err := f.fetchAndUpdateMetadata(ctx, src, fs.MetadataAsOpenOptions(ctx), dstInfo, true)
+	updateMetadata, err := metadataFS.fetchAndUpdateMetadata(ctx, src, fs.MetadataAsOpenOptions(ctx), dstInfo, true)
 	if err != nil {
 		return nil, err
 	}
 
 	// Do the move
 	var info *drive.File
-	err = f.pacer.Call(func() (bool, error) {
-		info, err = f.svc.Files.Update(shortcutID(srcObj.id), dstInfo).
+	err = pacerInstance.Call(func() (bool, error) {
+		info, err = svc.Files.Update(shortcutID(srcObj.id), dstInfo).
 			RemoveParents(srcParentID).
 			AddParents(dstParents).
 			Fields(f.getFileFields(ctx)).
@@ -3086,10 +4053,23 @@ func (f *Fs) PublicLink(ctx context.Context, remote string, expire fs.Duration, 
 		Type:               "anyone",
 	}
 
-	err = f.pacer.Call(func() (bool, error) {
+	ctx, _, err = bindAccountForWriteObject(ctx, f)
+	if err != nil {
+		return "", err
+	}
+	svc, err := f.svcFor(ctx)
+	if err != nil {
+		return "", err
+	}
+	pacerInstance, err := f.pacerFor(ctx)
+	if err != nil {
+		return "", err
+	}
+
+	err = pacerInstance.Call(func() (bool, error) {
 		// TODO: On TeamDrives this might fail if lacking permissions to change ACLs.
 		// Need to either check `canShare` attribute on the object or see if a sufficient permission is already present.
-		_, err = f.svc.Permissions.Create(id, permission).
+		_, err = svc.Permissions.Create(id, permission).
 			Fields("").
 			SupportsAllDrives(true).
 			Context(ctx).Do()
@@ -3110,6 +4090,19 @@ func (f *Fs) PublicLink(ctx context.Context, remote string, expire fs.Duration, 
 //
 // If destination exists then return fs.ErrorDirExists
 func (f *Fs) DirMove(ctx context.Context, src fs.Fs, srcRemote, dstRemote string) error {
+	ctx, _, err := bindAccountForWriteObject(ctx, f)
+	if err != nil {
+		return err
+	}
+	svc, err := f.svcFor(ctx)
+	if err != nil {
+		return err
+	}
+	pacerInstance, err := f.pacerFor(ctx)
+	if err != nil {
+		return err
+	}
+
 	srcFs, ok := src.(*Fs)
 	if !ok {
 		fs.Debugf(srcFs, "Can't move directory - not same remote type")
@@ -3129,8 +4122,8 @@ func (f *Fs) DirMove(ctx context.Context, src fs.Fs, srcRemote, dstRemote string
 	patch := drive.File{
 		Name: dstLeaf,
 	}
-	err = f.pacer.Call(func() (bool, error) {
-		_, err = f.svc.Files.Update(shortcutID(srcID), &patch).
+	err = pacerInstance.Call(func() (bool, error) {
+		_, err = svc.Files.Update(shortcutID(srcID), &patch).
 			RemoveParents(srcDirectoryID).
 			AddParents(dstDirectoryID).
 			Fields("").
@@ -3196,9 +4189,22 @@ func (f *Fs) ChangeNotify(ctx context.Context, notifyFunc func(string, fs.EntryT
 }
 
 func (f *Fs) changeNotifyStartPageToken(ctx context.Context) (pageToken string, err error) {
+	ctx, err = f.bindRuntimeForReadCall(ctx)
+	if err != nil {
+		return "", err
+	}
+	svc, err := f.svcFor(ctx)
+	if err != nil {
+		return "", err
+	}
+	pacerInstance, err := f.pacerFor(ctx)
+	if err != nil {
+		return "", err
+	}
+
 	var startPageToken *drive.StartPageToken
-	err = f.pacer.Call(func() (bool, error) {
-		changes := f.svc.Changes.GetStartPageToken().SupportsAllDrives(true)
+	err = pacerInstance.Call(func() (bool, error) {
+		changes := svc.Changes.GetStartPageToken().SupportsAllDrives(true)
 		if f.isTeamDrive {
 			changes.DriveId(f.opt.TeamDriveID)
 		}
@@ -3212,12 +4218,25 @@ func (f *Fs) changeNotifyStartPageToken(ctx context.Context) (pageToken string, 
 }
 
 func (f *Fs) changeNotifyRunner(ctx context.Context, notifyFunc func(string, fs.EntryType), startPageToken string) (newStartPageToken string, err error) {
+	ctx, err = f.bindRuntimeForReadCall(ctx)
+	if err != nil {
+		return "", err
+	}
+	svc, err := f.svcFor(ctx)
+	if err != nil {
+		return "", err
+	}
+	pacerInstance, err := f.pacerFor(ctx)
+	if err != nil {
+		return "", err
+	}
+
 	pageToken := startPageToken
 	for {
 		var changeList *drive.ChangeList
 
-		err = f.pacer.Call(func() (bool, error) {
-			changesCall := f.svc.Changes.List(pageToken).
+		err = pacerInstance.Call(func() (bool, error) {
+			changesCall := svc.Changes.List(pageToken).
 				Fields("nextPageToken,newStartPageToken,changes(fileId,file(name,parents,mimeType))")
 			if f.opt.ListChunk > 0 {
 				changesCall.PageSize(f.opt.ListChunk)
@@ -3304,6 +4323,20 @@ func (f *Fs) DirCacheFlush() {
 	f.dirCache.ResetRoot()
 }
 
+// Shutdown flushes pending token updates and stops background writer state.
+func (f *Fs) Shutdown(ctx context.Context) error {
+	if f == nil || f.accountStore == nil {
+		return nil
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := f.accountStore.shutdown(ctx); err != nil {
+		return fmt.Errorf("drive: shutdown token writer flush failed: %w", err)
+	}
+	return nil
+}
+
 // Hashes returns the supported hash sets.
 func (f *Fs) Hashes() hash.Set {
 	return hash.NewHashSet(hash.MD5, hash.SHA1, hash.SHA256)
@@ -3370,6 +4403,7 @@ func (f *Fs) changeServiceAccountFile(ctx context.Context, file string) (err err
 // Will not overwrite existing files
 func (f *Fs) makeShortcut(ctx context.Context, srcPath string, dstFs *Fs, dstPath string) (o fs.Object, err error) {
 	srcFs := f
+	srcCtx := contextOrBackground(ctx)
 	srcPath = strings.Trim(srcPath, "/")
 	dstPath = strings.Trim(dstPath, "/")
 	if dstPath == "" {
@@ -3381,17 +4415,17 @@ func (f *Fs) makeShortcut(ctx context.Context, srcPath string, dstFs *Fs, dstPat
 	isDir := false
 	if srcPath == "" {
 		// source is root directory
-		srcID, err = f.dirCache.RootID(ctx, false)
+		srcID, err = f.dirCache.RootID(srcCtx, false)
 		if err != nil {
 			return nil, err
 		}
 		isDir = true
-	} else if srcObj, err := srcFs.NewObject(ctx, srcPath); err != nil {
+	} else if srcObj, err := srcFs.NewObject(srcCtx, srcPath); err != nil {
 		if err != fs.ErrorIsDir {
 			return nil, fmt.Errorf("can't find source: %w", err)
 		}
 		// source was a directory
-		srcID, err = srcFs.dirCache.FindDir(ctx, srcPath, false)
+		srcID, err = srcFs.dirCache.FindDir(srcCtx, srcPath, false)
 		if err != nil {
 			return nil, fmt.Errorf("failed to find source dir: %w", err)
 		}
@@ -3402,8 +4436,21 @@ func (f *Fs) makeShortcut(ctx context.Context, srcPath string, dstFs *Fs, dstPat
 	}
 	srcID = actualID(srcID) // link to underlying object not to shortcut
 
+	dstCtx, _, err := bindAccountForWriteObject(srcCtx, dstFs)
+	if err != nil {
+		return nil, fmt.Errorf("shortcut destination bind failed: %w", err)
+	}
+	svc, err := dstFs.svcFor(dstCtx)
+	if err != nil {
+		return nil, fmt.Errorf("shortcut destination service lookup failed: %w", err)
+	}
+	pacerInstance, err := dstFs.pacerFor(dstCtx)
+	if err != nil {
+		return nil, fmt.Errorf("shortcut destination pacer lookup failed: %w", err)
+	}
+
 	// Find destination
-	_, err = dstFs.NewObject(ctx, dstPath)
+	_, err = dstFs.NewObject(dstCtx, dstPath)
 	if err != fs.ErrorObjectNotFound {
 		if err == nil {
 			err = errors.New("existing file")
@@ -3414,7 +4461,7 @@ func (f *Fs) makeShortcut(ctx context.Context, srcPath string, dstFs *Fs, dstPat
 	}
 
 	// Create destination shortcut
-	createInfo, err := dstFs.createFileInfo(ctx, dstPath, time.Now())
+	createInfo, err := dstFs.createFileInfo(dstCtx, dstPath, time.Now())
 	if err != nil {
 		return nil, fmt.Errorf("shortcut destination failed: %w", err)
 	}
@@ -3424,13 +4471,13 @@ func (f *Fs) makeShortcut(ctx context.Context, srcPath string, dstFs *Fs, dstPat
 	}
 
 	var info *drive.File
-	err = dstFs.pacer.Call(func() (bool, error) {
-		info, err = dstFs.svc.Files.Create(createInfo).
+	err = pacerInstance.Call(func() (bool, error) {
+		info, err = svc.Files.Create(createInfo).
 			Fields(partialFields).
 			SupportsAllDrives(true).
 			KeepRevisionForever(dstFs.opt.KeepRevisionForever).
-			Context(ctx).Do()
-		return dstFs.shouldRetry(ctx, err)
+			Context(dstCtx).Do()
+		return dstFs.shouldRetry(dstCtx, err)
 	})
 	if err != nil {
 		return nil, fmt.Errorf("shortcut creation failed: %w", err)
@@ -3438,19 +4485,31 @@ func (f *Fs) makeShortcut(ctx context.Context, srcPath string, dstFs *Fs, dstPat
 	if isDir {
 		return nil, nil
 	}
-	return dstFs.newObjectWithInfo(ctx, dstPath, info)
+	return dstFs.newObjectWithInfo(dstCtx, dstPath, info)
 }
 
 // List all team drives
 func (f *Fs) listTeamDrives(ctx context.Context) (drives []*drive.Drive, err error) {
+	ctx, err = f.bindRuntimeForReadCall(ctx)
+	if err != nil {
+		return nil, err
+	}
+	svc, err := f.svcFor(ctx)
+	if err != nil {
+		return nil, err
+	}
+	pacerInstance, err := f.pacerFor(ctx)
+	if err != nil {
+		return nil, err
+	}
+
 	drives = []*drive.Drive{}
-	listTeamDrives := f.svc.Drives.List().PageSize(100)
-	var defaultFs Fs // default Fs with default Options
+	listTeamDrives := svc.Drives.List().PageSize(100)
 	for {
 		var teamDrives *drive.DriveList
-		err = f.pacer.Call(func() (bool, error) {
+		err = pacerInstance.Call(func() (bool, error) {
 			teamDrives, err = listTeamDrives.Context(ctx).Do()
-			return defaultFs.shouldRetry(ctx, err)
+			return f.shouldRetry(ctx, err)
 		})
 		if err != nil {
 			return drives, fmt.Errorf("listing Team Drives failed: %w", err)
@@ -3488,15 +4547,36 @@ func (f *Fs) unTrash(ctx context.Context, dir string, directoryID string, recurs
 				ForceSendFields: []string{"Trashed"}, // necessary to set false value
 				Trashed:         false,
 			}
-			err := f.pacer.Call(func() (bool, error) {
-				_, err := f.svc.Files.Update(item.Id, &update).
+			restoreCtx, _, bindErr := bindAccountForWriteObject(ctx, f)
+			if bindErr != nil {
+				err = fmt.Errorf("failed to bind account for restore: %w", bindErr)
+				r.Errors++
+				fs.Errorf(remote, "%v", err)
+				return false
+			}
+			svc, svcErr := f.svcFor(restoreCtx)
+			if svcErr != nil {
+				err = fmt.Errorf("failed to resolve service for restore: %w", svcErr)
+				r.Errors++
+				fs.Errorf(remote, "%v", err)
+				return false
+			}
+			pacerInstance, pacerErr := f.pacerFor(restoreCtx)
+			if pacerErr != nil {
+				err = fmt.Errorf("failed to resolve pacer for restore: %w", pacerErr)
+				r.Errors++
+				fs.Errorf(remote, "%v", err)
+				return false
+			}
+			restoreErr := pacerInstance.Call(func() (bool, error) {
+				_, err := svc.Files.Update(item.Id, &update).
 					SupportsAllDrives(true).
 					Fields("trashed").
-					Context(ctx).Do()
-				return f.shouldRetry(ctx, err)
+					Context(restoreCtx).Do()
+				return f.shouldRetry(restoreCtx, err)
 			})
-			if err != nil {
-				err = fmt.Errorf("failed to restore: %w", err)
+			if restoreErr != nil {
+				err = fmt.Errorf("failed to restore: %w", restoreErr)
 				r.Errors++
 				fs.Errorf(remote, "%v", err)
 			} else {
@@ -3576,7 +4656,20 @@ func (f *Fs) copyOrMoveID(ctx context.Context, operation string, id, dest string
 
 // Run the drive query calling fn on each entry found
 func (f *Fs) queryFn(ctx context.Context, query string, fn func(*drive.File)) (err error) {
-	list := f.svc.Files.List()
+	ctx, err = f.bindRuntimeForReadCall(ctx)
+	if err != nil {
+		return err
+	}
+	svc, err := f.svcFor(ctx)
+	if err != nil {
+		return err
+	}
+	pacerInstance, err := f.pacerFor(ctx)
+	if err != nil {
+		return err
+	}
+
+	list := svc.Files.List()
 	if query != "" {
 		list.Q(query)
 	}
@@ -3597,7 +4690,7 @@ func (f *Fs) queryFn(ctx context.Context, query string, fn func(*drive.File)) (e
 	fields := fmt.Sprintf("files(%s),nextPageToken,incompleteSearch", f.getFileFields(ctx))
 	for {
 		var files *drive.FileList
-		err = f.pacer.Call(func() (bool, error) {
+		err = pacerInstance.Call(func() (bool, error) {
 			files, err = list.Fields(googleapi.Field(fields)).Context(ctx).Do()
 			return f.shouldRetry(ctx, err)
 		})
@@ -3647,13 +4740,28 @@ func (f *Fs) rescue(ctx context.Context, dirID string, delete bool) (err error) 
 			operations.SyncPrintf("%q, %q\n", item.Name, item.Id)
 		} else {
 			fs.Infof(item.Name, "Rescuing orphan %q", item.Id)
-			err = f.pacer.Call(func() (bool, error) {
-				_, err = f.svc.Files.Update(item.Id, nil).
+			rescueCtx, _, bindErr := bindAccountForWriteObject(ctx, f)
+			if bindErr != nil {
+				fs.Errorf(item.Name, "Failed to rescue orphan %q: %v", item.Id, bindErr)
+				return
+			}
+			svc, svcErr := f.svcFor(rescueCtx)
+			if svcErr != nil {
+				fs.Errorf(item.Name, "Failed to rescue orphan %q: %v", item.Id, svcErr)
+				return
+			}
+			pacerInstance, pacerErr := f.pacerFor(rescueCtx)
+			if pacerErr != nil {
+				fs.Errorf(item.Name, "Failed to rescue orphan %q: %v", item.Id, pacerErr)
+				return
+			}
+			err = pacerInstance.Call(func() (bool, error) {
+				_, err = svc.Files.Update(item.Id, nil).
 					AddParents(dirID).
 					Fields(f.getFileFields(ctx)).
 					SupportsAllDrives(true).
-					Context(ctx).Do()
-				return f.shouldRetry(ctx, err)
+					Context(rescueCtx).Do()
+				return f.shouldRetry(rescueCtx, err)
 			})
 			if err != nil {
 				fs.Errorf(item.Name, "Failed to rescue orphan %q: %v", item.Id, err)
@@ -4189,15 +5297,28 @@ func (o *baseObject) ModTime(ctx context.Context) time.Time {
 
 // SetModTime sets the modification time of the drive fs object
 func (o *baseObject) SetModTime(ctx context.Context, modTime time.Time) error {
+	ctx, _, err := bindAccountForWriteObject(ctx, o.fs)
+	if err != nil {
+		return err
+	}
+	svc, err := o.fs.svcFor(ctx)
+	if err != nil {
+		return err
+	}
+	pacerInstance, err := o.fs.pacerFor(ctx)
+	if err != nil {
+		return err
+	}
+
 	// New metadata
 	updateInfo := &drive.File{
 		ModifiedTime: modTime.Format(timeFormatOut),
 	}
 	// Set modified date
 	var info *drive.File
-	err := o.fs.pacer.Call(func() (bool, error) {
+	err = pacerInstance.Call(func() (bool, error) {
 		var err error
-		info, err = o.fs.svc.Files.Update(actualID(o.id), updateInfo).
+		info, err = svc.Files.Update(actualID(o.id), updateInfo).
 			Fields(partialFields).
 			SupportsAllDrives(true).
 			Context(ctx).Do()
@@ -4227,6 +5348,19 @@ func (o *baseObject) addResourceKey(header http.Header) {
 // httpResponse gets an http.Response object for the object
 // using the url and method passed in
 func (o *baseObject) httpResponse(ctx context.Context, url, method string, options []fs.OpenOption) (req *http.Request, res *http.Response, err error) {
+	ctx, err = o.fs.bindRuntimeForReadCall(ctx)
+	if err != nil {
+		return nil, nil, err
+	}
+	client, err := o.fs.clientFor(ctx)
+	if err != nil {
+		return nil, nil, err
+	}
+	pacerInstance, err := o.fs.pacerFor(ctx)
+	if err != nil {
+		return nil, nil, err
+	}
+
 	if url == "" {
 		return nil, nil, errors.New("forbidden to download - check sharing permission")
 	}
@@ -4240,8 +5374,8 @@ func (o *baseObject) httpResponse(ctx context.Context, url, method string, optio
 		delete(req.Header, "Range")
 	}
 	o.addResourceKey(req.Header)
-	err = o.fs.pacer.Call(func() (bool, error) {
-		res, err = o.fs.client.Do(req)
+	err = pacerInstance.Call(func() (bool, error) {
+		res, err = client.Do(req)
 		if err == nil {
 			err = googleapi.CheckResponse(res)
 			if err != nil {
@@ -4331,13 +5465,29 @@ func (o *baseObject) open(ctx context.Context, url string, options ...fs.OpenOpt
 
 // Open an object for read
 func (o *Object) Open(ctx context.Context, options ...fs.OpenOption) (in io.ReadCloser, err error) {
+	ctx, err = o.fs.bindRuntimeForReadCall(ctx)
+	if err != nil {
+		return nil, err
+	}
+	v2Svc, err := o.fs.v2SvcFor(ctx)
+	if err != nil {
+		if o.v2Download {
+			return nil, err
+		}
+		v2Svc = nil
+	}
+	pacerInstance, err := o.fs.pacerFor(ctx)
+	if err != nil {
+		return nil, err
+	}
+
 	if o.mimeType == shortcutMimeTypeDangling {
 		return nil, errors.New("can't read dangling shortcut")
 	}
-	if o.v2Download {
+	if o.v2Download && v2Svc != nil {
 		var v2File *drive_v2.File
-		err = o.fs.pacer.Call(func() (bool, error) {
-			v2File, err = o.fs.v2Svc.Files.Get(actualID(o.id)).
+		err = pacerInstance.Call(func() (bool, error) {
+			v2File, err = v2Svc.Files.Get(actualID(o.id)).
 				Fields("downloadUrl").
 				SupportsAllDrives(true).
 				Context(ctx).Do()
@@ -4414,19 +5564,43 @@ func (o *linkObject) Open(ctx context.Context, options ...fs.OpenOption) (in io.
 func (o *baseObject) update(ctx context.Context, updateInfo *drive.File, uploadMimeType string, in io.Reader,
 	src fs.ObjectInfo,
 ) (info *drive.File, err error) {
+	ctx, _, err = bindAccountForWriteObject(ctx, o.fs)
+	if err != nil {
+		return nil, err
+	}
+	svc, err := o.fs.svcFor(ctx)
+	if err != nil {
+		return nil, err
+	}
+	pacerInstance, err := o.fs.pacerFor(ctx)
+	if err != nil {
+		return nil, err
+	}
+
 	// Make the API request to upload metadata and file data.
 	size := src.Size()
 	if size >= 0 && size < int64(o.fs.opt.UploadCutoff) {
+		if o.fs.opt.SleepOnUploadLimit && size > 0 {
+			err = o.fs.waitForUploadBudget(ctx, size, func(d time.Duration) error {
+				return sleepWithContext(ctx, d)
+			})
+			if err != nil {
+				return nil, err
+			}
+		}
 		// Don't retry, return a retry error instead
-		err = o.fs.pacer.CallNoRetry(func() (bool, error) {
-			info, err = o.fs.svc.Files.Update(actualID(o.id), updateInfo).
+		err = pacerInstance.CallNoRetry(func() (bool, error) {
+			info, err = svc.Files.Update(actualID(o.id), updateInfo).
 				Media(in, googleapi.ContentType(uploadMimeType), googleapi.ChunkSize(0)).
 				Fields(partialFields).
 				SupportsAllDrives(true).
 				KeepRevisionForever(o.fs.opt.KeepRevisionForever).
 				Context(ctx).Do()
-			return o.fs.shouldRetry(ctx, err)
+			return o.fs.shouldRetryUpload(ctx, err, true)
 		})
+		if err == nil {
+			o.fs.noteSuccessfulUploadBytes(ctx, time.Now(), size)
+		}
 		return
 	}
 	// Upload the file in chunks
@@ -4465,7 +5639,15 @@ func (o *Object) Update(ctx context.Context, in io.Reader, src fs.ObjectInfo, op
 		ModifiedTime: src.ModTime(ctx).Format(timeFormatOut),
 	}
 
-	updateMetadata, err := o.fs.fetchAndUpdateMetadata(ctx, src, options, updateInfo, true)
+	ctx, _, err := bindAccountForWriteObject(ctx, o.fs)
+	if err != nil {
+		return err
+	}
+	metadataFS, err := o.fs.metadataRuntimeFS(ctx)
+	if err != nil {
+		return err
+	}
+	updateMetadata, err := metadataFS.fetchAndUpdateMetadata(ctx, src, options, updateInfo, true)
 	if err != nil {
 		return err
 	}

@@ -19,6 +19,7 @@ import (
 	"net/http"
 	"net/url"
 	"strconv"
+	"time"
 
 	"github.com/rclone/rclone/fs"
 	"github.com/rclone/rclone/fs/fserrors"
@@ -36,6 +37,8 @@ const (
 // It is not used by developers directly.
 type resumableUpload struct {
 	f      *Fs
+	pacer  *fs.Pacer
+	client *http.Client
 	remote string
 	// URI is the resumable resource destination provided by the server after specifying "&uploadType=resumable".
 	URI string
@@ -51,6 +54,19 @@ type resumableUpload struct {
 
 // Upload the io.Reader in of size bytes with contentType and info
 func (f *Fs) Upload(ctx context.Context, in io.Reader, size int64, contentType, fileID, remote string, info *drive.File) (*drive.File, error) {
+	ctx, _, err := bindAccountForWriteObject(ctx, f)
+	if err != nil {
+		return nil, err
+	}
+	pacerInstance, err := f.pacerFor(ctx)
+	if err != nil {
+		return nil, err
+	}
+	client, err := f.clientFor(ctx)
+	if err != nil {
+		return nil, err
+	}
+
 	params := url.Values{
 		"alt":        {"json"},
 		"uploadType": {"resumable"},
@@ -69,8 +85,7 @@ func (f *Fs) Upload(ctx context.Context, in io.Reader, size int64, contentType, 
 	}
 	urls += "?" + params.Encode()
 	var res *http.Response
-	var err error
-	err = f.pacer.Call(func() (bool, error) {
+	err = pacerInstance.Call(func() (bool, error) {
 		var body io.Reader
 		body, err = googleapi.WithoutDataWrapper.JSONReader(info)
 		if err != nil {
@@ -89,12 +104,12 @@ func (f *Fs) Upload(ctx context.Context, in io.Reader, size int64, contentType, 
 		if size >= 0 {
 			req.Header.Set("X-Upload-Content-Length", fmt.Sprintf("%v", size))
 		}
-		res, err = f.client.Do(req)
+		res, err = client.Do(req)
 		if err == nil {
 			defer googleapi.CloseBody(res)
 			err = googleapi.CheckResponse(res)
 		}
-		return f.shouldRetry(ctx, err)
+		return f.shouldRetryUpload(ctx, err, true)
 	})
 	if err != nil {
 		return nil, err
@@ -102,6 +117,8 @@ func (f *Fs) Upload(ctx context.Context, in io.Reader, size int64, contentType, 
 	loc := res.Header.Get("Location")
 	rx := &resumableUpload{
 		f:             f,
+		pacer:         pacerInstance,
+		client:        client,
 		remote:        remote,
 		URI:           loc,
 		Media:         in,
@@ -132,7 +149,7 @@ func (rx *resumableUpload) makeRequest(ctx context.Context, start int64, body io
 func (rx *resumableUpload) transferChunk(ctx context.Context, start int64, chunk io.ReadSeeker, chunkSize int64) (int, error) {
 	_, _ = chunk.Seek(0, io.SeekStart)
 	req := rx.makeRequest(ctx, start, chunk, chunkSize)
-	res, err := rx.f.client.Do(req)
+	res, err := rx.client.Do(req)
 	if err != nil {
 		return 599, err
 	}
@@ -195,11 +212,20 @@ func (rx *resumableUpload) Upload(ctx context.Context) (*drive.File, error) {
 			chunk = bytes.NewReader(buf[:reqSize])
 		}
 
+		if err := rx.f.waitForUploadBudget(ctx, reqSize, func(d time.Duration) error {
+			return sleepWithContext(ctx, d)
+		}); err != nil {
+			return nil, err
+		}
+
 		// Transfer the chunk
-		err = rx.f.pacer.Call(func() (bool, error) {
+		err = rx.pacer.Call(func() (bool, error) {
 			fs.Debugf(rx.remote, "Sending chunk %d length %d", start, reqSize)
 			StatusCode, err = rx.transferChunk(ctx, start, chunk, reqSize)
-			again, err := rx.f.shouldRetry(ctx, err)
+			if StatusCode == statusResumeIncomplete || StatusCode == http.StatusCreated || StatusCode == http.StatusOK {
+				rx.f.noteSuccessfulUploadBytes(ctx, time.Now(), reqSize)
+			}
+			again, err := rx.f.shouldRetryUpload(ctx, err, true)
 			if StatusCode == statusResumeIncomplete || StatusCode == http.StatusCreated || StatusCode == http.StatusOK {
 				again = false
 				err = nil

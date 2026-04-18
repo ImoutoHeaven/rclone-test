@@ -4,8 +4,11 @@ rclone
 rclone.exe
 build
 /docs/public/
+/docs/superpowers/
 /docs/.hugo_build.lock
 /docs/static/img/logos/
+/docs/plans/
+/.worktrees/
 rclone.iml
 .idea
 .history

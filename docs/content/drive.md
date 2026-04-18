@@ -345,6 +345,76 @@ d) Delete this remote
 y/e/d> y
 ```
 
+### Multi-account pooled mode
+
+Set `accounts_json` to an absolute local file path to enable multi-account mode.
+Legacy single-account mode is used only when `accounts_json` is exactly empty (`""`).
+Whitespace-only values are treated as provided `accounts_json` and fail validation.
+
+In multi-account mode:
+
+- `accounts_json` must be an absolute path to a readable local accounts file.
+- The accounts file supports either:
+  - JSON array (`[ {...}, {...} ]`)
+  - JSONL (one compact JSON object account per line)
+- Each account entry supports:
+  - `token` (required): JSON object containing OAuth token fields.
+  - `client_id` and `client_secret` (optional): fallback to backend-level values when empty.
+  - `upload_daily_limit` (optional): fallback to backend-level `upload_daily_limit` when unset.
+  - `name` (optional): display label only.
+- `token` must be a non-empty parseable OAuth token JSON object.
+- Backend-level `token` is ignored when `accounts_json` is set.
+- `account_selection_policy` controls account selection and accepts `round_robin` (default) or `random`.
+- Write operations use object-level account stickiness: each object upload binds to one account and keeps it for retries, resumable chunks, and post-upload metadata calls for that object.
+- Read and other non-object API calls select accounts per call.
+- Upload budget and sleep state are tracked per account.
+- When `sleep_on_upload_limit` is enabled, only the account that exceeds its budget sleeps until the next UTC midnight.
+- On write-path `userRateLimitExceeded`, only the current account sleeps until the next UTC midnight.
+- If all accounts are sleeping for writes, writes wait for the earliest account wake-up and then continue.
+- Upload sleep excludes only write-path selection; read-path selection ignores upload sleep.
+- Multi-account token writeback uses one single writer (single-writer) path that serializes accounts file updates inside this backend process.
+- Token persistence remains per-account isolated: a token refresh for one account updates only that account entry and does not overwrite other account tokens.
+- Token persistence writes the same `accounts_json` file in JSON-array format with `token` persisted as JSON object.
+- Token persistence uses atomic replacement (temp file + rename) with restrictive file permissions.
+- `accounts_json` must not be combined with `service_account_file`, `service_account_credentials`, or `env_auth`.
+- Exactly one of `team_drive` or `root_folder_id` must be set.
+- Startup validates that every configured account can access the configured namespace.
+
+Example config:
+
+```ini
+[drive-multi]
+type = drive
+accounts_json = /etc/rclone/drive-accounts.json
+account_selection_policy = round_robin
+team_drive = 0ABCDEF-01234567890
+```
+
+Example accounts file (JSON array):
+
+```json
+[
+  {
+    "name": "acc-a",
+    "client_id": "...",
+    "client_secret": "...",
+    "token": {
+      "access_token": "...",
+      "refresh_token": "...",
+      "expiry": "2026-04-18T00:00:00Z"
+    },
+    "upload_daily_limit": "750Gi"
+  }
+]
+```
+
+Example accounts file (JSONL):
+
+```json
+{"name":"acc-a","token":{"access_token":"...","refresh_token":"...","expiry":"2026-04-18T00:00:00Z"}}
+{"name":"acc-b","token":{"access_token":"...","refresh_token":"...","expiry":"2026-04-18T00:00:00Z"},"upload_daily_limit":"500Gi"}
+```
+
 ### --fast-list
 
 This remote supports `--fast-list` which allows you to use fewer
@@ -780,6 +850,46 @@ Properties:
 - Type:        string
 - Required:    false
 
+#### --drive-accounts-json
+
+Absolute local file path for multi-account pooled mode account definitions.
+
+The accounts file supports JSON array or JSONL.
+
+Each entry supports:
+
+- `token` (required): OAuth token JSON object.
+- `client_id` and `client_secret` (optional): fallback to backend-level values when empty.
+- `upload_daily_limit` (optional): fallback to backend-level `upload_daily_limit` when unset.
+- `name` (optional): display label only.
+
+When this is set:
+
+- Legacy backend-level `token` is ignored.
+- Exactly one of `team_drive` or `root_folder_id` must be set.
+- This cannot be combined with `service_account_file`, `service_account_credentials`, or `env_auth`.
+
+Properties:
+
+- Config:      accounts_json
+- Env Var:     RCLONE_DRIVE_ACCOUNTS_JSON
+- Type:        string
+- Required:    false
+
+#### --drive-account-selection-policy
+
+Account selection policy for multi-account mode.
+
+- `round_robin` (default): deterministic rotation over eligible accounts.
+- `random`: uniform random selection among eligible accounts.
+
+Properties:
+
+- Config:      account_selection_policy
+- Env Var:     RCLONE_DRIVE_ACCOUNT_SELECTION_POLICY
+- Type:        string
+- Default:     round_robin
+
 #### --drive-auth-owner-only
 
 Only consider files owned by the authenticated user.
@@ -1191,6 +1301,30 @@ Properties:
 - Env Var:     RCLONE_DRIVE_DISABLE_HTTP2
 - Type:        bool
 - Default:     true
+
+#### --drive-sleep-on-upload-limit
+
+If enabled, upload operations sleep until next UTC day when daily upload budget is reached.
+
+Properties:
+
+- Config:      sleep_on_upload_limit
+- Env Var:     RCLONE_DRIVE_SLEEP_ON_UPLOAD_LIMIT
+- Type:        bool
+- Default:     false
+
+#### --drive-upload-daily-limit
+
+Daily successful upload budget used with --drive-sleep-on-upload-limit.
+Examples: 750G, 750Gi, 750GiB.
+
+
+Properties:
+
+- Config:      upload_daily_limit
+- Env Var:     RCLONE_DRIVE_UPLOAD_DAILY_LIMIT
+- Type:        SizeSuffix
+- Default:     750Gi
 
 #### --drive-stop-on-upload-limit
 
