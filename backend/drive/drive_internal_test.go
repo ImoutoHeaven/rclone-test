@@ -940,7 +940,7 @@ func TestBindWriteOperationAccountKeepsSameRuntimeForObjectLifecycle(t *testing.
 	require.NoError(t, err)
 	require.NotNil(t, runtimeWrite1Repeat)
 	assert.Same(t, runtimeWrite1, runtimeWrite1Repeat)
-	assert.Equal(t, ctxWrite1, ctxWrite1Repeat)
+	assert.Same(t, ctxWrite1, ctxWrite1Repeat)
 
 	runtimeFromBoundCtx, err := runtimeFromContext(ctxWrite1Repeat, f)
 	require.NoError(t, err)
@@ -1459,7 +1459,7 @@ func TestPerAccountBudgetRolloverOccursIndependently(t *testing.T) {
 }
 
 func TestProactiveBudgetOverflowSetsPerAccountUploadSleepUntilUTC(t *testing.T) {
-	now := time.Now().UTC()
+	now := time.Date(2026, 4, 16, 12, 0, 0, 0, time.UTC)
 	today := utcDayStart(now)
 	limit := fs.SizeSuffix(10 * fs.Mebi)
 
@@ -1475,6 +1475,9 @@ func TestProactiveBudgetOverflowSetsPerAccountUploadSleepUntilUTC(t *testing.T) 
 		accountPool: &accountPool{
 			accounts: []*accountRuntime{runtime0, runtime1},
 		},
+		nowFn: func() time.Time {
+			return now
+		},
 	}
 
 	ctx0 := context.WithValue(context.Background(), accountRuntimeKey, runtime0)
@@ -1488,7 +1491,6 @@ func TestProactiveBudgetOverflowSetsPerAccountUploadSleepUntilUTC(t *testing.T) 
 	assert.True(t, slept)
 
 	runtime0.state.mu.RLock()
-	runtime0DayStart := runtime0.state.dayStartUTC
 	runtime0Wake := runtime0.state.uploadSleepUntilUTC
 	runtime0.state.mu.RUnlock()
 
@@ -1497,7 +1499,7 @@ func TestProactiveBudgetOverflowSetsPerAccountUploadSleepUntilUTC(t *testing.T) 
 	runtime1.state.mu.RUnlock()
 
 	assert.False(t, runtime0Wake.IsZero())
-	assert.Equal(t, runtime0DayStart.Add(24*time.Hour), runtime0Wake)
+	assert.Equal(t, now.Add(time.Hour), runtime0Wake)
 	assert.Equal(t, time.UTC, runtime0Wake.Location())
 	assert.True(t, runtime1Wake.IsZero())
 }
@@ -1643,14 +1645,14 @@ func TestReactiveUserRateLimitExceededSleepsOnlyCurrentAccount(t *testing.T) {
 	require.True(t, retry)
 	require.Equal(t, gerr, err)
 	assert.Equal(t, 1, sleepCalls)
-	assert.Equal(t, 12*time.Hour, slept)
+	assert.Equal(t, time.Hour, slept)
 
-	assert.Equal(t, time.Date(2026, 4, 17, 0, 0, 0, 0, time.UTC), runtime0.uploadSleepUntilUTC())
+	assert.Equal(t, time.Date(2026, 4, 16, 13, 0, 0, 0, time.UTC), runtime0.uploadSleepUntilUTC())
 	assert.True(t, runtime1.uploadSleepUntilUTC().IsZero())
 
 	boundCtx, boundRuntime, bindErr := bindAccountForWriteObject(ctx, f)
 	require.NoError(t, bindErr)
-	assert.Equal(t, ctx, boundCtx)
+	assert.Same(t, runtime0, contextBoundRuntime(boundCtx))
 	assert.Same(t, runtime0, boundRuntime)
 }
 
@@ -2121,7 +2123,164 @@ func TestShouldRetryUploadPathUserRateLimitExceededSleep(t *testing.T) {
 	assert.True(t, retry)
 	assert.Equal(t, gerr, err)
 	assert.Equal(t, 1, sleepCalls)
-	assert.Greater(t, slept, time.Duration(0))
+	assert.Equal(t, time.Hour, slept)
+}
+
+func TestPerAccountSleepRecoversAndResetsQuotaOnSuccessfulProbe(t *testing.T) {
+	runtime := newTestAccountRuntimeForPool(0, false, time.Time{})
+
+	f := &Fs{
+		opt:         Options{SleepOnUploadLimit: true, UploadDailyLimit: defaultUploadDailyLimit},
+		accountPool: &accountPool{accounts: []*accountRuntime{runtime}},
+	}
+
+	now := time.Date(2026, 4, 16, 12, 0, 0, 0, time.UTC)
+	f.nowFn = func() time.Time { return now }
+
+	runtime.state.mu.Lock()
+	runtime.state.dayStartUTC = utcDayStart(now)
+	runtime.state.usedBytes = 123
+	runtime.state.uploadSleepUntilUTC = now.Add(time.Hour)
+	runtime.state.mu.Unlock()
+
+	ctx := context.WithValue(context.Background(), accountRuntimeKey, runtime)
+	ctx = withUploadProbeState(ctx)
+	markUploadProbeQuotaReset(ctx)
+	f.noteSuccessfulUploadBytes(ctx, now, 11)
+
+	runtime.state.mu.RLock()
+	defer runtime.state.mu.RUnlock()
+	assert.True(t, runtime.state.uploadSleepUntilUTC.IsZero())
+	assert.Equal(t, int64(11), runtime.state.usedBytes)
+}
+
+func TestBudgetSleepSuccessBeforeWakeDoesNotResetOrClearSleep(t *testing.T) {
+	runtime := newTestAccountRuntimeForPool(0, false, time.Time{})
+
+	now := time.Date(2026, 4, 16, 9, 0, 0, 0, time.UTC)
+	runtime.state.dayStartUTC = utcDayStart(now)
+	runtime.state.usedBytes = 20
+	runtime.state.uploadSleepUntilUTC = now.Add(time.Hour)
+
+	f := &Fs{
+		opt:         Options{SleepOnUploadLimit: true, UploadDailyLimit: defaultUploadDailyLimit},
+		accountPool: &accountPool{accounts: []*accountRuntime{runtime}},
+	}
+
+	ctx := context.WithValue(context.Background(), accountRuntimeKey, runtime)
+	ctx = withUploadProbeState(ctx)
+	f.noteSuccessfulUploadBytes(ctx, now, 5)
+
+	runtime.state.mu.RLock()
+	defer runtime.state.mu.RUnlock()
+	assert.Equal(t, now.Add(time.Hour), runtime.state.uploadSleepUntilUTC)
+	assert.Equal(t, int64(25), runtime.state.usedBytes)
+}
+
+func TestBudgetSleepSuccessAfterWakeClearsSleepWithoutReset(t *testing.T) {
+	runtime := newTestAccountRuntimeForPool(0, false, time.Time{})
+
+	now := time.Date(2026, 4, 16, 10, 0, 0, 0, time.UTC)
+	runtime.state.dayStartUTC = utcDayStart(now)
+	runtime.state.usedBytes = 20
+	runtime.state.uploadSleepUntilUTC = now
+
+	f := &Fs{
+		opt:         Options{SleepOnUploadLimit: true, UploadDailyLimit: defaultUploadDailyLimit},
+		accountPool: &accountPool{accounts: []*accountRuntime{runtime}},
+	}
+
+	ctx := context.WithValue(context.Background(), accountRuntimeKey, runtime)
+	ctx = withUploadProbeState(ctx)
+	f.noteSuccessfulUploadBytes(ctx, now, 5)
+
+	runtime.state.mu.RLock()
+	defer runtime.state.mu.RUnlock()
+	assert.True(t, runtime.state.uploadSleepUntilUTC.IsZero())
+	assert.Equal(t, int64(25), runtime.state.usedBytes)
+}
+
+func TestWaitForUploadBudgetPerAccountSleepsInProbeIntervals(t *testing.T) {
+	now := time.Date(2026, 4, 16, 10, 0, 0, 0, time.UTC)
+	limit := fs.SizeSuffix(10 * fs.Mebi)
+	runtime := newTestAccountRuntimeForPool(0, false, time.Time{})
+	runtime.uploadDailyLimit = limit
+	runtime.state.dayStartUTC = utcDayStart(now)
+	runtime.state.usedBytes = int64(limit)
+
+	f := &Fs{
+		opt:         Options{SleepOnUploadLimit: true, UploadDailyLimit: limit},
+		accountPool: &accountPool{accounts: []*accountRuntime{runtime}},
+		nowFn: func() time.Time {
+			return now
+		},
+	}
+
+	ctx := context.WithValue(context.Background(), accountRuntimeKey, runtime)
+	var waits []time.Duration
+	err := f.waitForUploadBudget(ctx, 1, func(d time.Duration) error {
+		waits = append(waits, d)
+		now = now.Add(d)
+		if len(waits) >= 3 {
+			return context.Canceled
+		}
+		return nil
+	})
+
+	require.ErrorIs(t, err, context.Canceled)
+	require.Len(t, waits, 3)
+	assert.Equal(t, []time.Duration{time.Hour, time.Hour, time.Hour}, waits)
+}
+
+func TestShouldRetryUploadPathUserRateLimitExceededRepeatsHourlyProbe(t *testing.T) {
+	f := newTestFsForRetry(t)
+	f.opt.SleepOnUploadLimit = true
+
+	now := time.Date(2026, 4, 16, 12, 0, 0, 0, time.UTC)
+	f.nowFn = func() time.Time { return now }
+
+	runtime := newTestAccountRuntimeForPool(0, false, time.Time{})
+	f.accountPool = &accountPool{accounts: []*accountRuntime{runtime}}
+
+	var waits []time.Duration
+	f.sleepFn = func(_ context.Context, d time.Duration) error {
+		waits = append(waits, d)
+		now = now.Add(d)
+		return nil
+	}
+
+	gerr := &googleapi.Error{
+		Code: 403,
+		Errors: []googleapi.ErrorItem{{
+			Reason:  "userRateLimitExceeded",
+			Message: "User rate limit exceeded.",
+		}},
+	}
+
+	ctx := context.WithValue(context.Background(), accountRuntimeKey, runtime)
+	ctx = withUploadProbeState(ctx)
+	for range 3 {
+		retry, err := f.shouldRetryUpload(ctx, gerr, true)
+		require.True(t, retry)
+		require.Equal(t, gerr, err)
+	}
+
+	assert.Equal(t, []time.Duration{time.Hour, time.Hour, time.Hour}, waits)
+	assert.Equal(t, now, runtime.uploadSleepUntilUTC())
+}
+
+func TestBindWriteOperationRebindResetsUploadProbeState(t *testing.T) {
+	primary := newTestFsWithAccountPool("round_robin", 1)
+	foreign := newTestFsWithAccountPool("round_robin", 1)
+
+	foreignCtx, _, err := bindAccountForWriteObject(context.Background(), foreign)
+	require.NoError(t, err)
+	markUploadProbeQuotaReset(foreignCtx)
+
+	bindingCtx, _, err := bindAccountForWriteObject(foreignCtx, primary)
+	require.NoError(t, err)
+
+	assert.False(t, consumeUploadProbeQuotaReset(bindingCtx))
 }
 
 func TestShouldRetryUploadPathFatalRefreshDisablesOnlyBoundRuntime(t *testing.T) {

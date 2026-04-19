@@ -73,6 +73,7 @@ const (
 	minChunkSize            = fs.SizeSuffix(googleapi.MinUploadChunkSize)
 	defaultChunkSize        = 8 * fs.Mebi
 	defaultUploadDailyLimit = 750 * fs.Gibi
+	uploadProbeInterval     = time.Hour
 	partialFields           = "id,name,size,md5Checksum,sha1Checksum,sha256Checksum,trashed,explicitlyTrashed,modifiedTime,createdTime,mimeType,parents,webViewLink,shortcutDetails,exportLinks,resourceKey"
 	listRGrouping           = 50   // number of IDs to search at once when using ListR
 	listRInputBuffer        = 1000 // size of input buffer when using ListR
@@ -1118,13 +1119,11 @@ func (f *Fs) shouldRetryUpload(ctx context.Context, err error, isUploadPath bool
 
 	if isUploadPath && f.opt.SleepOnUploadLimit && reason == "userRateLimitExceeded" {
 		now := f.nowUTC()
-		wake := utcDayStart(now).Add(24 * time.Hour)
+		wait := uploadProbeWait(now)
+		wake := now.Add(wait)
+		markUploadProbeQuotaReset(ctx)
 		if runtime := f.boundUploadBudgetRuntime(ctx); runtime != nil {
 			runtime.setUploadSleepUntilUTC(wake)
-		}
-		wait := wake.Sub(now)
-		if wait < 0 {
-			wait = 0
 		}
 		if wait > 0 {
 			if sleepErr := f.sleep(ctx, wait); sleepErr != nil {
@@ -1953,6 +1952,18 @@ func durationUntilNextUTCDay(now time.Time) time.Duration {
 	return d
 }
 
+func uploadProbeWait(now time.Time) time.Duration {
+	wait := uploadProbeInterval
+	untilDayBoundary := durationUntilNextUTCDay(now)
+	if untilDayBoundary > 0 && untilDayBoundary < wait {
+		wait = untilDayBoundary
+	}
+	if wait < 0 {
+		return 0
+	}
+	return wait
+}
+
 func (f *Fs) rolloverUploadBudgetLocked(now time.Time) {
 	start := utcDayStart(now)
 	if f.uploadBudget.dayStartUTC.IsZero() || !f.uploadBudget.dayStartUTC.Equal(start) {
@@ -1985,7 +1996,15 @@ func (f *Fs) noteSuccessfulUploadBytes(ctx context.Context, now time.Time, n int
 	}
 	runtime := f.boundUploadBudgetRuntime(ctx)
 	if runtime != nil {
+		shouldResetQuota := consumeUploadProbeQuotaReset(ctx)
 		runtime.state.mu.Lock()
+		sleepUntil := runtime.state.uploadSleepUntilUTC
+		if shouldResetQuota {
+			runtime.state.uploadSleepUntilUTC = time.Time{}
+			runtime.state.usedBytes = 0
+		} else if !sleepUntil.IsZero() && !now.UTC().Before(sleepUntil) {
+			runtime.state.uploadSleepUntilUTC = time.Time{}
+		}
 		rolloverAccountUploadBudgetLocked(runtime, now)
 		runtime.state.usedBytes += n
 		runtime.state.mu.Unlock()
@@ -2013,7 +2032,7 @@ func (f *Fs) waitForUploadBudget(ctx context.Context, want int64, sleeper func(t
 		overSized := want > limit
 		oversizedWaitedForRollover := false
 		for {
-			now := time.Now().UTC()
+			now := f.nowUTC()
 			runtime.state.mu.Lock()
 			rolloverAccountUploadBudgetLocked(runtime, now)
 			used := runtime.state.usedBytes
@@ -2021,14 +2040,18 @@ func (f *Fs) waitForUploadBudget(ctx context.Context, want int64, sleeper func(t
 				runtime.state.mu.Unlock()
 				return nil
 			}
-			wake := utcDayStart(now).Add(24 * time.Hour)
-			wait := wake.Sub(now)
-			if wait < 0 {
-				wait = 0
+			wait := durationUntilNextUTCDay(now)
+			if overSized {
+				wait = durationUntilNextUTCDay(now)
+			} else {
+				wait = uploadProbeWait(now)
 			}
-			runtime.state.uploadSleepUntilUTC = wake
+			runtime.state.uploadSleepUntilUTC = now.Add(wait)
 			runtime.state.mu.Unlock()
 			if wait <= 0 {
+				if overSized {
+					oversizedWaitedForRollover = true
+				}
 				continue
 			}
 			if err := sleeper(wait); err != nil {
@@ -2040,21 +2063,29 @@ func (f *Fs) waitForUploadBudget(ctx context.Context, want int64, sleeper func(t
 		}
 	}
 
-	overSized := want > int64(f.opt.UploadDailyLimit)
+	limit := int64(f.opt.UploadDailyLimit)
+	overSized := want > limit
 	oversizedWaitedForRollover := false
 	for {
-		now := time.Now().UTC()
+		now := f.nowUTC()
 		f.uploadBudget.mu.Lock()
 		f.rolloverUploadBudgetLocked(now)
 		used := f.uploadBudget.usedBytes
-		limit := int64(f.opt.UploadDailyLimit)
 		if (!overSized && used+want <= limit) || (overSized && oversizedWaitedForRollover) {
 			f.uploadBudget.mu.Unlock()
 			return nil
 		}
 		wait := durationUntilNextUTCDay(now)
+		if overSized {
+			wait = durationUntilNextUTCDay(now)
+		} else {
+			wait = uploadProbeWait(now)
+		}
 		f.uploadBudget.mu.Unlock()
 		if wait <= 0 {
+			if overSized {
+				oversizedWaitedForRollover = true
+			}
 			continue
 		}
 		if err := sleeper(wait); err != nil {
