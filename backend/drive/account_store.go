@@ -49,6 +49,15 @@ type persistedAccountJSON struct {
 	UploadDailyLimit string          `json:"upload_daily_limit,omitempty"`
 }
 
+type accountsJSONFormat int
+
+const (
+	accountsJSONFormatJSONArray accountsJSONFormat = iota
+	accountsJSONFormatJSONL
+)
+
+var persistedCredentialFields = []string{"token", "client_id", "client_secret"}
+
 func newAccountStore(initial []accountConfig, persistFn func(string) error) *accountStore {
 	if persistFn == nil {
 		persistFn = func(string) error { return nil }
@@ -401,13 +410,116 @@ func sleepContext(ctx context.Context, d time.Duration) error {
 	}
 }
 
+func decodeAccountsJSONObjects(contents []byte) ([]map[string]json.RawMessage, accountsJSONFormat, bool, error) {
+	raw := string(contents)
+	hasTrailingNewline := strings.HasSuffix(raw, "\n")
+	trimmed := strings.TrimSpace(raw)
+	if trimmed == "" {
+		return nil, accountsJSONFormatJSONArray, hasTrailingNewline, fmt.Errorf("drive: accounts_json file is empty")
+	}
+
+	if strings.HasPrefix(trimmed, "[") {
+		var entries []map[string]json.RawMessage
+		if err := json.Unmarshal([]byte(trimmed), &entries); err != nil {
+			return nil, accountsJSONFormatJSONArray, hasTrailingNewline, fmt.Errorf("drive: invalid accounts_json JSON array: %w", err)
+		}
+		if len(entries) == 0 {
+			return nil, accountsJSONFormatJSONArray, hasTrailingNewline, fmt.Errorf("drive: accounts_json must not be empty array")
+		}
+		return entries, accountsJSONFormatJSONArray, hasTrailingNewline, nil
+	}
+
+	lines := strings.Split(trimmed, "\n")
+	entries := make([]map[string]json.RawMessage, 0, len(lines))
+	for lineNo, line := range lines {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		var entry map[string]json.RawMessage
+		if err := json.Unmarshal([]byte(line), &entry); err != nil {
+			return nil, accountsJSONFormatJSONL, hasTrailingNewline, fmt.Errorf("drive: invalid accounts_json JSONL at line %d: %w", lineNo+1, err)
+		}
+		entries = append(entries, entry)
+	}
+	if len(entries) == 0 {
+		return nil, accountsJSONFormatJSONL, hasTrailingNewline, fmt.Errorf("drive: accounts_json file is empty")
+	}
+	return entries, accountsJSONFormatJSONL, hasTrailingNewline, nil
+}
+
+func encodeAccountsJSONObjects(entries []map[string]json.RawMessage, format accountsJSONFormat, hasTrailingNewline bool) (string, error) {
+	switch format {
+	case accountsJSONFormatJSONArray:
+		buf, err := json.Marshal(entries)
+		if err != nil {
+			return "", err
+		}
+		return string(buf), nil
+	case accountsJSONFormatJSONL:
+		lines := make([]string, len(entries))
+		for i, entry := range entries {
+			buf, err := json.Marshal(entry)
+			if err != nil {
+				return "", err
+			}
+			lines[i] = string(buf)
+		}
+		out := strings.Join(lines, "\n")
+		if hasTrailingNewline {
+			out += "\n"
+		}
+		return out, nil
+	default:
+		return "", fmt.Errorf("drive: unknown accounts_json format %d", format)
+	}
+}
+
+func mergePersistedCredentialFields(existing, updated map[string]json.RawMessage) {
+	if existing == nil {
+		return
+	}
+	for _, field := range persistedCredentialFields {
+		value, ok := updated[field]
+		if !ok {
+			delete(existing, field)
+			continue
+		}
+		existing[field] = append(json.RawMessage(nil), value...)
+	}
+}
+
+func mergePersistedAccountsJSON(existingContents []byte, updatedContents string) (string, error) {
+	existingEntries, format, hasTrailingNewline, err := decodeAccountsJSONObjects(existingContents)
+	if err != nil {
+		return "", err
+	}
+	updatedEntries, _, _, err := decodeAccountsJSONObjects([]byte(updatedContents))
+	if err != nil {
+		return "", err
+	}
+	if len(existingEntries) != len(updatedEntries) {
+		return "", fmt.Errorf("drive: accounts_json entry count changed from %d to %d", len(existingEntries), len(updatedEntries))
+	}
+
+	for i := range existingEntries {
+		if existingEntries[i] == nil {
+			existingEntries[i] = make(map[string]json.RawMessage)
+		}
+		mergePersistedCredentialFields(existingEntries[i], updatedEntries[i])
+	}
+
+	return encodeAccountsJSONObjects(existingEntries, format, hasTrailingNewline)
+}
+
 func persistAccountsJSONFile(accountsPath, accountsJSON string) error {
 	normalizedPath := strings.TrimSpace(accountsPath)
 	if !filepath.IsAbs(normalizedPath) {
 		return fmt.Errorf("drive: accounts_json must be an absolute path to a local file")
 	}
 
-	if _, err := os.Stat(normalizedPath); err != nil {
+	existingContents, err := os.ReadFile(normalizedPath)
+	if err != nil {
 		switch {
 		case errors.Is(err, os.ErrNotExist):
 			return fmt.Errorf("drive: accounts_json file not found: %w", err)
@@ -416,6 +528,11 @@ func persistAccountsJSONFile(accountsPath, accountsJSON string) error {
 		default:
 			return fmt.Errorf("drive: failed to access accounts_json file: %w", err)
 		}
+	}
+
+	mergedAccountsJSON, err := mergePersistedAccountsJSON(existingContents, accountsJSON)
+	if err != nil {
+		return fmt.Errorf("drive: failed to merge accounts_json updates: %w", err)
 	}
 
 	dir := filepath.Dir(normalizedPath)
@@ -436,7 +553,7 @@ func persistAccountsJSONFile(accountsPath, accountsJSON string) error {
 		return fmt.Errorf("drive: failed to set secure permissions on temporary accounts_json file: %w", err)
 	}
 
-	if _, err := tmpFile.WriteString(accountsJSON); err != nil {
+	if _, err := tmpFile.WriteString(mergedAccountsJSON); err != nil {
 		_ = tmpFile.Close()
 		return fmt.Errorf("drive: failed to write temporary accounts_json file: %w", err)
 	}

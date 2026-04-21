@@ -417,6 +417,90 @@ func TestParseAccountsJSONParsesJSONL(t *testing.T) {
 	assert.Equal(t, "entry-client", accounts[1].clientID)
 }
 
+func TestPersistAccountsJSONFilePreservesJSONLFormatAndUnknownFields(t *testing.T) {
+	line0 := fmt.Sprintf(`{"name":"a0","token":%s,"client_id":"old-client-0","custom":"keep-0"}`, testParseAccountsJSONToken("a0"))
+	line1 := fmt.Sprintf(`{"name":"a1","token":%s,"client_secret":"old-secret-1","enabled":true}`, testParseAccountsJSONToken("a1"))
+	accountsPath := writeTempAccountsFile(t, line0+"\n"+line1+"\n")
+
+	accounts, err := parseAccountsJSON(accountsPath, &Options{UploadDailyLimit: defaultUploadDailyLimit})
+	require.NoError(t, err)
+
+	store := newAccountStore(accounts, func(accountsJSON string) error {
+		return persistAccountsJSONFile(accountsPath, accountsJSON)
+	})
+	t.Cleanup(func() {
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), time.Second)
+		defer cancel()
+		_ = store.shutdown(shutdownCtx)
+	})
+
+	store.setAccountToken(0, testParseAccountsJSONToken("updated-a0"))
+	store.setAccountClientID(0, "updated-client-0")
+	store.setAccountClientSecret(1, "updated-secret-1")
+
+	flushCtx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	require.NoError(t, store.flush(flushCtx))
+
+	raw, err := os.ReadFile(accountsPath)
+	require.NoError(t, err)
+	assert.True(t, strings.HasSuffix(string(raw), "\n"))
+	lines := strings.Split(strings.TrimSpace(string(raw)), "\n")
+	require.Len(t, lines, 2)
+	assert.False(t, strings.HasPrefix(strings.TrimSpace(string(raw)), "["))
+
+	var entry0 map[string]json.RawMessage
+	require.NoError(t, json.Unmarshal([]byte(lines[0]), &entry0))
+	assert.JSONEq(t, testParseAccountsJSONToken("updated-a0"), string(entry0["token"]))
+	assert.JSONEq(t, `"updated-client-0"`, string(entry0["client_id"]))
+	assert.JSONEq(t, `"keep-0"`, string(entry0["custom"]))
+
+	var entry1 map[string]json.RawMessage
+	require.NoError(t, json.Unmarshal([]byte(lines[1]), &entry1))
+	assert.JSONEq(t, testParseAccountsJSONToken("a1"), string(entry1["token"]))
+	assert.JSONEq(t, `"updated-secret-1"`, string(entry1["client_secret"]))
+	assert.JSONEq(t, `true`, string(entry1["enabled"]))
+}
+
+func TestPersistAccountsJSONFilePreservesJSONArrayFormatAndUnknownFields(t *testing.T) {
+	rawInput := fmt.Sprintf(`[{"name":"a0","token":%s,"client_id":"old-client-0","custom":"keep-0"},{"name":"a1","token":%s,"client_secret":"old-secret-1","enabled":true}]`, testParseAccountsJSONToken("a0"), testParseAccountsJSONToken("a1"))
+	accountsPath := writeTempAccountsFile(t, rawInput)
+
+	accounts, err := parseAccountsJSON(accountsPath, &Options{UploadDailyLimit: defaultUploadDailyLimit})
+	require.NoError(t, err)
+
+	store := newAccountStore(accounts, func(accountsJSON string) error {
+		return persistAccountsJSONFile(accountsPath, accountsJSON)
+	})
+	t.Cleanup(func() {
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), time.Second)
+		defer cancel()
+		_ = store.shutdown(shutdownCtx)
+	})
+
+	store.setAccountToken(0, testParseAccountsJSONToken("updated-a0"))
+	store.setAccountClientID(0, "updated-client-0")
+	store.setAccountClientSecret(1, "updated-secret-1")
+
+	flushCtx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	require.NoError(t, store.flush(flushCtx))
+
+	raw, err := os.ReadFile(accountsPath)
+	require.NoError(t, err)
+	assert.True(t, strings.HasPrefix(strings.TrimSpace(string(raw)), "["))
+
+	var entries []map[string]json.RawMessage
+	require.NoError(t, json.Unmarshal(raw, &entries))
+	require.Len(t, entries, 2)
+	assert.JSONEq(t, testParseAccountsJSONToken("updated-a0"), string(entries[0]["token"]))
+	assert.JSONEq(t, `"updated-client-0"`, string(entries[0]["client_id"]))
+	assert.JSONEq(t, `"keep-0"`, string(entries[0]["custom"]))
+	assert.JSONEq(t, testParseAccountsJSONToken("a1"), string(entries[1]["token"]))
+	assert.JSONEq(t, `"updated-secret-1"`, string(entries[1]["client_secret"]))
+	assert.JSONEq(t, `true`, string(entries[1]["enabled"]))
+}
+
 func testAccountConfigsForMapperAndStore() []accountConfig {
 	return []accountConfig{
 		{
@@ -666,7 +750,7 @@ func TestPersistAccountsJSONFileAtomicallyReplacesAndUsesSecurePermissions(t *te
 
 	raw, err := os.ReadFile(accountsPath)
 	require.NoError(t, err)
-	assert.JSONEq(t, newPayload, string(raw))
+	assert.JSONEq(t, `[{"name":"old","token":{"access_token":"new","refresh_token":"refresh-new","expiry":"2026-04-17T00:00:00Z"}}]`, string(raw))
 
 	info, err := os.Stat(accountsPath)
 	require.NoError(t, err)
