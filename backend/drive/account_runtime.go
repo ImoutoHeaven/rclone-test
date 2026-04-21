@@ -31,12 +31,13 @@ var fatalRefreshErrorReasons = []string{
 }
 
 type accountRuntimeState struct {
-	mu                  sync.RWMutex
-	active              bool
-	disabled            bool
-	dayStartUTC         time.Time
-	usedBytes           int64
-	uploadSleepUntilUTC time.Time
+	mu                               sync.RWMutex
+	active                           bool
+	disabled                         bool
+	dayStartUTC                      time.Time
+	usedBytes                        int64
+	uploadSleepUntilUTC              time.Time
+	resetQuotaOnNextSuccessfulUpload bool
 }
 
 type accountRuntime struct {
@@ -95,6 +96,36 @@ func (rt *accountRuntime) setUploadSleepUntilUTC(wake time.Time) {
 	}
 	rt.state.mu.Lock()
 	rt.state.uploadSleepUntilUTC = wake.UTC()
+	rt.state.mu.Unlock()
+}
+
+func (rt *accountRuntime) markQuotaResetOnNextSuccess() {
+	if rt == nil {
+		return
+	}
+	rt.state.mu.Lock()
+	rt.state.resetQuotaOnNextSuccessfulUpload = true
+	rt.state.mu.Unlock()
+}
+
+func (rt *accountRuntime) consumeQuotaResetOnNextSuccess() bool {
+	if rt == nil {
+		return false
+	}
+	rt.state.mu.Lock()
+	defer rt.state.mu.Unlock()
+	shouldReset := rt.state.resetQuotaOnNextSuccessfulUpload
+	rt.state.resetQuotaOnNextSuccessfulUpload = false
+	return shouldReset
+}
+
+func (rt *accountRuntime) markUploadLimitSleep(wake time.Time) {
+	if rt == nil {
+		return
+	}
+	rt.state.mu.Lock()
+	rt.state.uploadSleepUntilUTC = wake.UTC()
+	rt.state.resetQuotaOnNextSuccessfulUpload = true
 	rt.state.mu.Unlock()
 }
 

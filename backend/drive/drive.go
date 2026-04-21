@@ -1095,6 +1095,10 @@ func (f *Fs) sleep(ctx context.Context, d time.Duration) error {
 	return sleepWithContext(ctx, d)
 }
 
+func (f *Fs) usesUploadAccountFailover() bool {
+	return f != nil && f.opt.SleepOnUploadLimit && f.accountPool != nil && f.accountPool.hasMultipleAccounts()
+}
+
 func (f *Fs) disableBoundRuntimeOnFatalRefresh(ctx context.Context, err error) {
 	if f == nil || f.accountPool == nil || err == nil {
 		return
@@ -1111,10 +1115,66 @@ func (f *Fs) disableBoundRuntimeOnFatalRefresh(ctx context.Context, err error) {
 	}
 }
 
+type accountUploadLimitError struct {
+	cause error
+	wake  time.Time
+}
+
+func (e *accountUploadLimitError) Error() string {
+	if e == nil || e.cause == nil {
+		return ""
+	}
+	return e.cause.Error()
+}
+
+func (e *accountUploadLimitError) Unwrap() error {
+	if e == nil {
+		return nil
+	}
+	return e.cause
+}
+
+func isAccountUploadLimitError(err error) bool {
+	var target *accountUploadLimitError
+	return errors.As(err, &target)
+}
+
+type oversizedUploadLimitError struct {
+	cause error
+	wake  time.Time
+}
+
+func (e *oversizedUploadLimitError) Error() string {
+	if e == nil || e.cause == nil {
+		return ""
+	}
+	return e.cause.Error()
+}
+
+func (e *oversizedUploadLimitError) Unwrap() error {
+	if e == nil {
+		return nil
+	}
+	return e.cause
+}
+
+func isOversizedUploadLimitError(err error) bool {
+	var target *oversizedUploadLimitError
+	return errors.As(err, &target)
+}
+
 func (f *Fs) shouldRetryUpload(ctx context.Context, err error, isUploadPath bool) (bool, error) {
 	reason := ""
 	if gerr, ok := err.(*googleapi.Error); ok && len(gerr.Errors) > 0 {
 		reason = gerr.Errors[0].Reason
+	}
+
+	runtime := f.boundUploadBudgetRuntime(ctx)
+	if isUploadPath && f.usesUploadAccountFailover() && runtime != nil && reason == "userRateLimitExceeded" {
+		now := f.nowUTC()
+		wake := now.Add(uploadProbeWait(now))
+		runtime.markUploadLimitSleep(wake)
+		return false, &accountUploadLimitError{cause: err, wake: wake}
 	}
 
 	if isUploadPath && f.opt.SleepOnUploadLimit && reason == "userRateLimitExceeded" {
@@ -1122,7 +1182,7 @@ func (f *Fs) shouldRetryUpload(ctx context.Context, err error, isUploadPath bool
 		wait := uploadProbeWait(now)
 		wake := now.Add(wait)
 		markUploadProbeQuotaReset(ctx)
-		if runtime := f.boundUploadBudgetRuntime(ctx); runtime != nil {
+		if runtime != nil {
 			runtime.setUploadSleepUntilUTC(wake)
 		}
 		if wait > 0 {
@@ -1995,6 +2055,22 @@ func (f *Fs) noteSuccessfulUploadBytes(ctx context.Context, now time.Time, n int
 		return
 	}
 	runtime := f.boundUploadBudgetRuntime(ctx)
+	if runtime != nil && f.usesUploadAccountFailover() {
+		runtime.state.mu.Lock()
+		shouldResetQuota := runtime.state.resetQuotaOnNextSuccessfulUpload
+		runtime.state.resetQuotaOnNextSuccessfulUpload = false
+		sleepUntil := runtime.state.uploadSleepUntilUTC
+		if shouldResetQuota {
+			runtime.state.uploadSleepUntilUTC = time.Time{}
+			runtime.state.usedBytes = 0
+		} else if !sleepUntil.IsZero() && !now.UTC().Before(sleepUntil) {
+			runtime.state.uploadSleepUntilUTC = time.Time{}
+		}
+		rolloverAccountUploadBudgetLocked(runtime, now)
+		runtime.state.usedBytes += n
+		runtime.state.mu.Unlock()
+		return
+	}
 	if runtime != nil {
 		shouldResetQuota := consumeUploadProbeQuotaReset(ctx)
 		runtime.state.mu.Lock()
@@ -2014,6 +2090,108 @@ func (f *Fs) noteSuccessfulUploadBytes(ctx context.Context, now time.Time, n int
 	defer f.uploadBudget.mu.Unlock()
 	f.rolloverUploadBudgetLocked(now)
 	f.uploadBudget.usedBytes += n
+}
+
+func (f *Fs) checkUploadBudgetForAttempt(ctx context.Context, want int64) error {
+	return f.checkUploadBudget(ctx, want, true)
+}
+
+func (f *Fs) checkUploadBudgetForChunk(ctx context.Context, want int64) error {
+	return f.checkUploadBudget(ctx, want, true)
+}
+
+func (f *Fs) checkUploadBudget(ctx context.Context, want int64, allowOversized bool) error {
+	if !f.usesUploadAccountFailover() || want <= 0 {
+		return nil
+	}
+	runtime := f.boundUploadBudgetRuntime(ctx)
+	if runtime == nil {
+		return nil
+	}
+	limit := int64(runtime.uploadDailyLimit)
+	if limit <= 0 {
+		limit = int64(f.opt.UploadDailyLimit)
+	}
+	if limit <= 0 {
+		return nil
+	}
+	now := f.nowUTC()
+	runtime.state.mu.Lock()
+	defer runtime.state.mu.Unlock()
+	rolloverAccountUploadBudgetLocked(runtime, now)
+	if runtime.state.resetQuotaOnNextSuccessfulUpload && !now.UTC().Before(runtime.state.uploadSleepUntilUTC) && want <= limit {
+		return nil
+	}
+	if allowOversized && want > limit {
+		if !runtime.state.uploadSleepUntilUTC.IsZero() && !now.UTC().Before(runtime.state.uploadSleepUntilUTC) && !runtime.state.resetQuotaOnNextSuccessfulUpload {
+			runtime.state.uploadSleepUntilUTC = time.Time{}
+			return nil
+		}
+		wake := now.Add(durationUntilNextUTCDay(now))
+		runtime.state.uploadSleepUntilUTC = wake
+		runtime.state.resetQuotaOnNextSuccessfulUpload = false
+		return &oversizedUploadLimitError{cause: fserrors.RetryErrorf("upload size %d exceeds per-account limit %d", want, limit), wake: wake}
+	}
+	if runtime.state.usedBytes+want <= limit {
+		return nil
+	}
+	wake := now.Add(uploadProbeWait(now))
+	runtime.state.uploadSleepUntilUTC = wake
+	runtime.state.resetQuotaOnNextSuccessfulUpload = true
+	return &accountUploadLimitError{cause: fserrors.RetryErrorf("upload budget exhausted for account %d", runtime.index), wake: wake}
+}
+
+type uploadAttemptRunner[T any] func(context.Context, io.Reader) (T, error)
+
+func executeUploadWithAccountFailover[T any](f *Fs, ctx context.Context, in io.Reader, run uploadAttemptRunner[T]) (T, error) {
+	var zero T
+	if !f.usesUploadAccountFailover() {
+		return run(ctx, in)
+	}
+	seeker, rewindable := in.(io.Seeker)
+	attempted := map[int]struct{}{}
+	for {
+		runtime, outcome, wait, err := f.accountPool.selectWriteAccountForRound(attempted)
+		if err != nil && outcome == selectWriteAccountOutcomeAllDisabled {
+			return zero, err
+		}
+		switch outcome {
+		case selectWriteAccountOutcomeStartNextRound:
+			attempted = map[int]struct{}{}
+			continue
+		case selectWriteAccountOutcomeWaitForPoolWake:
+			if wait > 0 {
+				if err := f.sleep(ctx, wait); err != nil {
+					return zero, err
+				}
+			}
+			attempted = map[int]struct{}{}
+			continue
+		case selectWriteAccountOutcomeAllDisabled:
+			if err == nil {
+				err = errNoAvailableAccount
+			}
+			return zero, err
+		}
+		if runtime == nil {
+			return zero, errNoAvailableAccount
+		}
+		attempted[runtime.index] = struct{}{}
+		attemptCtx := context.WithValue(contextOrBackground(ctx), accountRuntimeKey, runtime)
+		result, err := run(attemptCtx, in)
+		if err == nil {
+			return result, nil
+		}
+		if !isAccountUploadLimitError(err) && !isOversizedUploadLimitError(err) {
+			return zero, err
+		}
+		if !rewindable {
+			return zero, fserrors.RetryErrorf("upload must be retried to switch accounts")
+		}
+		if _, seekErr := seeker.Seek(0, io.SeekStart); seekErr != nil {
+			return zero, fserrors.RetryErrorf("upload must be retried to switch accounts")
+		}
+	}
 }
 
 func (f *Fs) waitForUploadBudget(ctx context.Context, want int64, sleeper func(time.Duration) error) error {
@@ -3356,19 +3534,6 @@ func (f *Fs) PutStream(ctx context.Context, in io.Reader, src fs.ObjectInfo, opt
 // This will create a duplicate if we upload a new file without
 // checking to see if there is one already - use Put() for that.
 func (f *Fs) PutUnchecked(ctx context.Context, in io.Reader, src fs.ObjectInfo, options ...fs.OpenOption) (fs.Object, error) {
-	ctx, _, err := bindAccountForWriteObject(ctx, f)
-	if err != nil {
-		return nil, err
-	}
-	svc, err := f.svcFor(ctx)
-	if err != nil {
-		return nil, err
-	}
-	pacerInstance, err := f.pacerFor(ctx)
-	if err != nil {
-		return nil, err
-	}
-
 	remote := src.Remote()
 	size := src.Size()
 	modTime := src.ModTime(ctx)
@@ -3402,52 +3567,63 @@ func (f *Fs) PutUnchecked(ctx context.Context, in io.Reader, src fs.ObjectInfo, 
 	} else {
 		createInfo.MimeType = fs.MimeTypeFromName(remote)
 	}
-	metadataFS, err := f.metadataRuntimeFS(ctx)
-	if err != nil {
-		return nil, err
-	}
-	updateMetadata, err := metadataFS.fetchAndUpdateMetadata(ctx, src, options, createInfo, false)
-	if err != nil {
-		return nil, err
-	}
+	return executeUploadWithAccountFailover(f, ctx, in, func(attemptCtx context.Context, attemptIn io.Reader) (fs.Object, error) {
+		attemptCtx, _, err := bindAccountForWriteObject(attemptCtx, f)
+		if err != nil {
+			return nil, err
+		}
+		svc, err := f.svcFor(attemptCtx)
+		if err != nil {
+			return nil, err
+		}
+		pacerInstance, err := f.pacerFor(attemptCtx)
+		if err != nil {
+			return nil, err
+		}
+		attemptCreateInfo := *createInfo
+		updateMetadata, err := f.fetchAndUpdateMetadata(attemptCtx, src, options, &attemptCreateInfo, false)
+		if err != nil {
+			return nil, err
+		}
 
-	var info *drive.File
-	if size >= 0 && size < int64(f.opt.UploadCutoff) {
-		if f.opt.SleepOnUploadLimit && size > 0 {
-			err = f.waitForUploadBudget(ctx, size, func(d time.Duration) error {
-				return sleepWithContext(ctx, d)
+		var info *drive.File
+		if size >= 0 && size < int64(f.opt.UploadCutoff) {
+			if size > 0 {
+				if f.usesUploadAccountFailover() {
+					err = f.checkUploadBudgetForAttempt(attemptCtx, size)
+				} else if f.opt.SleepOnUploadLimit {
+					err = f.waitForUploadBudget(attemptCtx, size, func(d time.Duration) error {
+						return sleepWithContext(attemptCtx, d)
+					})
+				}
+				if err != nil {
+					return nil, err
+				}
+			}
+			err = pacerInstance.CallNoRetry(func() (bool, error) {
+				info, err = svc.Files.Create(&attemptCreateInfo).
+					Media(attemptIn, googleapi.ContentType(srcMimeType), googleapi.ChunkSize(0)).
+					Fields(partialFields).
+					SupportsAllDrives(true).
+					KeepRevisionForever(f.opt.KeepRevisionForever).
+					Context(attemptCtx).Do()
+				return f.shouldRetryUpload(attemptCtx, err, true)
 			})
 			if err != nil {
 				return nil, err
 			}
+			f.noteSuccessfulUploadBytes(attemptCtx, time.Now(), size)
+		} else {
+			info, err = f.uploadOneAttempt(attemptCtx, attemptIn, size, srcMimeType, "", remote, &attemptCreateInfo)
+			if err != nil {
+				return nil, err
+			}
 		}
-		// Make the API request to upload metadata and file data.
-		// Don't retry, return a retry error instead
-		err = pacerInstance.CallNoRetry(func() (bool, error) {
-			info, err = svc.Files.Create(createInfo).
-				Media(in, googleapi.ContentType(srcMimeType), googleapi.ChunkSize(0)).
-				Fields(partialFields).
-				SupportsAllDrives(true).
-				KeepRevisionForever(f.opt.KeepRevisionForever).
-				Context(ctx).Do()
-			return f.shouldRetryUpload(ctx, err, true)
-		})
-		if err != nil {
+		if err := updateMetadata(attemptCtx, info); err != nil {
 			return nil, err
 		}
-		f.noteSuccessfulUploadBytes(ctx, time.Now(), size)
-	} else {
-		// Upload the file in chunks
-		info, err = f.Upload(ctx, in, size, srcMimeType, "", remote, createInfo)
-		if err != nil {
-			return nil, err
-		}
-	}
-	err = updateMetadata(ctx, info)
-	if err != nil {
-		return nil, err
-	}
-	return f.newObjectWithInfo(ctx, remote, info)
+		return f.newObjectWithInfo(attemptCtx, remote, info)
+	})
 }
 
 // MergeDirs merges the contents of all the directories passed
@@ -5611,10 +5787,14 @@ func (o *baseObject) update(ctx context.Context, updateInfo *drive.File, uploadM
 	// Make the API request to upload metadata and file data.
 	size := src.Size()
 	if size >= 0 && size < int64(o.fs.opt.UploadCutoff) {
-		if o.fs.opt.SleepOnUploadLimit && size > 0 {
-			err = o.fs.waitForUploadBudget(ctx, size, func(d time.Duration) error {
-				return sleepWithContext(ctx, d)
-			})
+		if size > 0 {
+			if o.fs.usesUploadAccountFailover() {
+				err = o.fs.checkUploadBudgetForAttempt(ctx, size)
+			} else if o.fs.opt.SleepOnUploadLimit {
+				err = o.fs.waitForUploadBudget(ctx, size, func(d time.Duration) error {
+					return sleepWithContext(ctx, d)
+				})
+			}
 			if err != nil {
 				return nil, err
 			}
@@ -5635,7 +5815,7 @@ func (o *baseObject) update(ctx context.Context, updateInfo *drive.File, uploadM
 		return
 	}
 	// Upload the file in chunks
-	return o.fs.Upload(ctx, in, size, uploadMimeType, o.id, o.remote, updateInfo)
+	return o.fs.uploadOneAttempt(ctx, in, size, uploadMimeType, o.id, o.remote, updateInfo)
 }
 
 // Update the already existing object
@@ -5670,24 +5850,25 @@ func (o *Object) Update(ctx context.Context, in io.Reader, src fs.ObjectInfo, op
 		ModifiedTime: src.ModTime(ctx).Format(timeFormatOut),
 	}
 
-	ctx, _, err := bindAccountForWriteObject(ctx, o.fs)
-	if err != nil {
-		return err
-	}
-	metadataFS, err := o.fs.metadataRuntimeFS(ctx)
-	if err != nil {
-		return err
-	}
-	updateMetadata, err := metadataFS.fetchAndUpdateMetadata(ctx, src, options, updateInfo, true)
-	if err != nil {
-		return err
-	}
-
-	info, err := o.baseObject.update(ctx, updateInfo, srcMimeType, in, src)
-	if err != nil {
-		return err
-	}
-	err = updateMetadata(ctx, info)
+	info, err := executeUploadWithAccountFailover(o.fs, ctx, in, func(attemptCtx context.Context, attemptIn io.Reader) (*drive.File, error) {
+		attemptCtx, _, err := bindAccountForWriteObject(attemptCtx, o.fs)
+		if err != nil {
+			return nil, err
+		}
+		attemptUpdateInfo := *updateInfo
+		updateMetadata, err := o.fs.fetchAndUpdateMetadata(attemptCtx, src, options, &attemptUpdateInfo, true)
+		if err != nil {
+			return nil, err
+		}
+		info, err := o.baseObject.update(attemptCtx, &attemptUpdateInfo, srcMimeType, attemptIn, src)
+		if err != nil {
+			return nil, err
+		}
+		if err := updateMetadata(attemptCtx, info); err != nil {
+			return nil, err
+		}
+		return info, nil
+	})
 	if err != nil {
 		return err
 	}
@@ -5725,7 +5906,14 @@ func (o *documentObject) Update(ctx context.Context, in io.Reader, src fs.Object
 	}
 	updateInfo.MimeType = importMimeType
 
-	info, err := o.baseObject.update(ctx, updateInfo, srcMimeType, in, src)
+	info, err := executeUploadWithAccountFailover(o.fs, ctx, in, func(attemptCtx context.Context, attemptIn io.Reader) (*drive.File, error) {
+		attemptCtx, _, err := bindAccountForWriteObject(attemptCtx, o.fs)
+		if err != nil {
+			return nil, err
+		}
+		attemptUpdateInfo := *updateInfo
+		return o.baseObject.update(attemptCtx, &attemptUpdateInfo, srcMimeType, attemptIn, src)
+	})
 	if err != nil {
 		return err
 	}

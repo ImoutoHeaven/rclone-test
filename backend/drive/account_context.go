@@ -24,6 +24,9 @@ func bindAccountForWriteObject(ctx context.Context, f *Fs) (context.Context, *ac
 
 	ctx = contextOrBackground(ctx)
 	if runtime := contextBoundRuntime(ctx); runtime != nil && f.runtimeBelongsToPool(runtime) {
+		if f.accountPool != nil && f.accountPool.hasMultipleAccounts() {
+			return ctx, runtime, nil
+		}
 		return withUploadProbeState(ctx), runtime, nil
 	}
 
@@ -36,7 +39,9 @@ func bindAccountForWriteObject(ctx context.Context, f *Fs) (context.Context, *ac
 		return ctx, nil, err
 	}
 	ctx = context.WithValue(ctx, accountRuntimeKey, runtime)
-	ctx = withFreshUploadProbeState(ctx)
+	if !f.accountPool.hasMultipleAccounts() {
+		ctx = withFreshUploadProbeState(ctx)
+	}
 	return ctx, runtime, nil
 }
 

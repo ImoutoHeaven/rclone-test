@@ -19,6 +19,15 @@ const (
 	operationPathWrite
 )
 
+type selectWriteAccountOutcome int
+
+const (
+	selectWriteAccountOutcomeSelected selectWriteAccountOutcome = iota
+	selectWriteAccountOutcomeStartNextRound
+	selectWriteAccountOutcomeWaitForPoolWake
+	selectWriteAccountOutcomeAllDisabled
+)
+
 type accountPool struct {
 	policy        string
 	rrCursor      uint64
@@ -61,6 +70,10 @@ func (p *accountPool) waitForWake(ctx context.Context, d time.Duration) error {
 		return p.waitForWakeFn(ctx, d)
 	}
 	return sleepWithContext(ctx, d)
+}
+
+func (p *accountPool) hasMultipleAccounts() bool {
+	return p != nil && len(p.accounts) > 1
 }
 
 func (p *accountPool) selectAccount(ctx context.Context, pathKind operationPathKind) (*accountRuntime, error) {
@@ -117,6 +130,72 @@ func (p *accountPool) selectRoundRobin(pathKind operationPathKind, now time.Time
 	}
 
 	return nil, false
+}
+
+func (p *accountPool) selectWriteAccountForRound(attempted map[int]struct{}) (*accountRuntime, selectWriteAccountOutcome, time.Duration, error) {
+	now := p.nowUTC()
+	eligibleIgnoringAttempted := p.eligibleAccounts(operationPathWrite, now)
+	eligible := make([]*accountRuntime, 0, len(eligibleIgnoringAttempted))
+	for _, runtime := range eligibleIgnoringAttempted {
+		if _, seen := attempted[runtime.index]; seen {
+			continue
+		}
+		eligible = append(eligible, runtime)
+	}
+	if len(eligible) > 0 {
+		selected, err := p.selectEligibleForPolicy(eligible)
+		return selected, selectWriteAccountOutcomeSelected, 0, err
+	}
+	if len(eligibleIgnoringAttempted) > 0 {
+		return nil, selectWriteAccountOutcomeStartNextRound, 0, nil
+	}
+	wait, canWait, disabledCount := p.waitDurationUntilEarliestWriteWake(now)
+	if canWait {
+		return nil, selectWriteAccountOutcomeWaitForPoolWake, wait, nil
+	}
+	if disabledCount == len(p.accounts) {
+		return nil, selectWriteAccountOutcomeAllDisabled, 0, errNoAvailableAccount
+	}
+	return nil, selectWriteAccountOutcomeWaitForPoolWake, 0, nil
+}
+
+func (p *accountPool) selectEligibleForPolicy(eligible []*accountRuntime) (*accountRuntime, error) {
+	switch p.policy {
+	case "random":
+		return p.selectRandom(eligible)
+	default:
+		return p.selectRoundRobinFromEligible(eligible), nil
+	}
+}
+
+func (p *accountPool) selectRoundRobinFromEligible(eligible []*accountRuntime) *accountRuntime {
+	if p == nil || len(p.accounts) == 0 || len(eligible) == 0 {
+		return nil
+	}
+
+	eligibleSet := make(map[*accountRuntime]struct{}, len(eligible))
+	for _, runtime := range eligible {
+		if runtime != nil {
+			eligibleSet[runtime] = struct{}{}
+		}
+	}
+
+	p.rrMu.Lock()
+	defer p.rrMu.Unlock()
+
+	accountCount := len(p.accounts)
+	start := int(atomic.LoadUint64(&p.rrCursor) % uint64(accountCount))
+	for offset := 0; offset < accountCount; offset++ {
+		index := (start + offset) % accountCount
+		runtime := p.accounts[index]
+		if _, ok := eligibleSet[runtime]; !ok {
+			continue
+		}
+		atomic.StoreUint64(&p.rrCursor, uint64((index+1)%accountCount))
+		return runtime
+	}
+
+	return nil
 }
 
 func (p *accountPool) selectRandom(eligible []*accountRuntime) (*accountRuntime, error) {

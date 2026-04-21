@@ -863,6 +863,71 @@ func newTestAccountRuntimeForPool(index int, disabled bool, uploadSleepUntilUTC 
 	return rt
 }
 
+func TestAccountRuntimeConsumePendingQuotaResetOnce(t *testing.T) {
+	runtime := newTestAccountRuntimeForPool(0, false, time.Time{})
+
+	runtime.markQuotaResetOnNextSuccess()
+	assert.True(t, runtime.consumeQuotaResetOnNextSuccess())
+	assert.False(t, runtime.consumeQuotaResetOnNextSuccess())
+}
+
+func TestAccountRuntimeSleepAndQuotaResetCanBeMarkedTogether(t *testing.T) {
+	now := time.Date(2026, 4, 16, 12, 0, 0, 0, time.UTC)
+	runtime := newTestAccountRuntimeForPool(0, false, time.Time{})
+
+	runtime.markUploadLimitSleep(now.Add(time.Hour))
+
+	assert.Equal(t, now.Add(time.Hour), runtime.uploadSleepUntilUTC())
+	assert.True(t, runtime.consumeQuotaResetOnNextSuccess())
+}
+
+func TestSelectWriteAccountForRoundSkipsAttemptedAccounts(t *testing.T) {
+	now := time.Date(2026, 4, 16, 12, 0, 0, 0, time.UTC)
+	runtime0 := newTestAccountRuntimeForPool(0, false, time.Time{})
+	runtime1 := newTestAccountRuntimeForPool(1, false, time.Time{})
+	pool := &accountPool{policy: "round_robin", accounts: []*accountRuntime{runtime0, runtime1}, nowFn: func() time.Time { return now }}
+
+	runtime, outcome, wait, err := pool.selectWriteAccountForRound(map[int]struct{}{0: {}})
+	require.NoError(t, err)
+	assert.Equal(t, selectWriteAccountOutcomeSelected, outcome)
+	assert.Zero(t, wait)
+	assert.Same(t, runtime1, runtime)
+}
+
+func TestSelectWriteAccountForRoundSignalsImmediateNewRound(t *testing.T) {
+	now := time.Date(2026, 4, 16, 12, 0, 0, 0, time.UTC)
+	runtime0 := newTestAccountRuntimeForPool(0, false, time.Time{})
+	pool := &accountPool{policy: "round_robin", accounts: []*accountRuntime{runtime0}, nowFn: func() time.Time { return now }}
+
+	runtime, outcome, wait, err := pool.selectWriteAccountForRound(map[int]struct{}{0: {}})
+	require.NoError(t, err)
+	assert.Nil(t, runtime)
+	assert.Equal(t, selectWriteAccountOutcomeStartNextRound, outcome)
+	assert.Zero(t, wait)
+}
+
+func TestSelectWriteAccountForRoundSignalsPoolSleep(t *testing.T) {
+	now := time.Date(2026, 4, 16, 12, 0, 0, 0, time.UTC)
+	runtime0 := newTestAccountRuntimeForPool(0, false, now.Add(10*time.Minute))
+	pool := &accountPool{policy: "round_robin", accounts: []*accountRuntime{runtime0}, nowFn: func() time.Time { return now }}
+
+	runtime, outcome, wait, err := pool.selectWriteAccountForRound(nil)
+	require.NoError(t, err)
+	assert.Nil(t, runtime)
+	assert.Equal(t, selectWriteAccountOutcomeWaitForPoolWake, outcome)
+	assert.Equal(t, 10*time.Minute, wait)
+}
+
+func TestSelectWriteAccountForRoundReturnsAllDisabledOutcome(t *testing.T) {
+	pool := &accountPool{policy: "round_robin", accounts: []*accountRuntime{newTestAccountRuntimeForPool(0, true, time.Time{})}}
+
+	runtime, outcome, wait, err := pool.selectWriteAccountForRound(nil)
+	require.ErrorIs(t, err, errNoAvailableAccount)
+	assert.Nil(t, runtime)
+	assert.Equal(t, selectWriteAccountOutcomeAllDisabled, outcome)
+	assert.Zero(t, wait)
+}
+
 func TestAccountPoolRoundRobinSkipsIneligibleAccounts(t *testing.T) {
 	now := time.Now().UTC()
 	pool := &accountPool{
@@ -1149,16 +1214,18 @@ func TestShouldRetryDoesNotDisableForeignRuntimeFromContext(t *testing.T) {
 }
 
 type driveRoutingRecorder struct {
-	mu        stdsync.Mutex
-	byKind    map[string][]int
-	allCalls  []string
-	lastPaths map[string]string
+	mu          stdsync.Mutex
+	byKind      map[string][]int
+	allCalls    []string
+	lastPaths   map[string]string
+	chunkRanges map[int][]string
 }
 
 func newDriveRoutingRecorder() *driveRoutingRecorder {
 	return &driveRoutingRecorder{
-		byKind:    make(map[string][]int),
-		lastPaths: make(map[string]string),
+		byKind:      make(map[string][]int),
+		lastPaths:   make(map[string]string),
+		chunkRanges: make(map[int][]string),
 	}
 }
 
@@ -1183,9 +1250,25 @@ func (r *driveRoutingRecorder) dumpCalls() string {
 	return strings.Join(r.allCalls, "\n")
 }
 
+func (r *driveRoutingRecorder) recordChunkRange(account int, contentRange string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.chunkRanges[account] = append(r.chunkRanges[account], contentRange)
+}
+
+func (r *driveRoutingRecorder) chunkRangesFor(account int) []string {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	ranges := r.chunkRanges[account]
+	return append([]string(nil), ranges...)
+}
+
 type driveRoutingTransport struct {
 	account  int
 	recorder *driveRoutingRecorder
+
+	failUploadStart bool
+	failChunkCall   int
 
 	mu         stdsync.Mutex
 	chunkCalls int
@@ -1193,19 +1276,40 @@ type driveRoutingTransport struct {
 
 func (t *driveRoutingTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 	path := req.URL.Path
+	uploadType := req.URL.Query().Get("uploadType")
 
 	switch {
-	case req.Method == http.MethodPatch && strings.Contains(path, "/upload/drive/v3/files/"):
+	case (req.Method == http.MethodPost || req.Method == http.MethodPatch) && strings.Contains(path, "/upload/drive/v3/files") && uploadType == "resumable":
 		t.recorder.record(t.account, "upload.start", path)
+		if t.failUploadStart {
+			body := `{"error":{"code":403,"errors":[{"reason":"userRateLimitExceeded","message":"User rate limit exceeded."}],"message":"User rate limit exceeded."}}`
+			return newDriveRoutingResponse(req, http.StatusForbidden, body, nil), nil
+		}
 		location := fmt.Sprintf("https://upload.local/session/account-%d", t.account)
 		return newDriveRoutingResponse(req, http.StatusOK, `{}`, map[string]string{"Location": location}), nil
 
+	case req.Method == http.MethodPost && path == "/upload/drive/v3/files":
+		t.recorder.record(t.account, "files.create", path)
+		body := `{"id":"obj-1","name":"file.txt","mimeType":"text/plain","md5Checksum":"md5","sha1Checksum":"sha1","sha256Checksum":"sha256","modifiedTime":"2026-04-17T00:00:00.000Z","size":"3","parents":["root"]}`
+		return newDriveRoutingResponse(req, http.StatusOK, body, nil), nil
+
+	case req.Method == http.MethodPatch && strings.Contains(path, "/upload/drive/v3/files/"):
+		t.recorder.record(t.account, "files.update", path)
+		body := `{"id":"obj-1","name":"file.txt","mimeType":"text/plain","md5Checksum":"md5","sha1Checksum":"sha1","sha256Checksum":"sha256","modifiedTime":"2026-04-17T00:00:00.000Z","size":"3","parents":["root"]}`
+		return newDriveRoutingResponse(req, http.StatusOK, body, nil), nil
+
 	case req.Method == http.MethodPost && strings.Contains(path, "/session/account-"):
 		t.recorder.record(t.account, "upload.chunk", path)
+		t.recorder.recordChunkRange(t.account, req.Header.Get("Content-Range"))
 		t.mu.Lock()
 		t.chunkCalls++
 		chunkCall := t.chunkCalls
 		t.mu.Unlock()
+
+		if t.failChunkCall > 0 && chunkCall == t.failChunkCall {
+			body := `{"error":{"code":403,"errors":[{"reason":"userRateLimitExceeded","message":"User rate limit exceeded."}],"message":"User rate limit exceeded."}}`
+			return newDriveRoutingResponse(req, http.StatusForbidden, body, nil), nil
+		}
 
 		if chunkCall == 1 {
 			return newDriveRoutingResponse(req, statusResumeIncomplete, "", nil), nil
@@ -1220,7 +1324,7 @@ func (t *driveRoutingTransport) RoundTrip(req *http.Request) (*http.Response, er
 
 	case req.Method == http.MethodPost && path == "/drive/v3/files":
 		t.recorder.record(t.account, "files.create", path)
-		body := `{"id":"shortcut-1","name":"shortcut.txt","mimeType":"application/vnd.google-apps.shortcut","modifiedTime":"2026-04-17T00:00:00.000Z","size":"0","parents":["root"]}`
+		body := `{"id":"obj-1","name":"file.txt","mimeType":"text/plain","md5Checksum":"md5","sha1Checksum":"sha1","sha256Checksum":"sha256","modifiedTime":"2026-04-17T00:00:00.000Z","size":"3","parents":["root"]}`
 		return newDriveRoutingResponse(req, http.StatusOK, body, nil), nil
 
 	case req.Method == http.MethodGet && path == "/drive/v3/files":
@@ -1277,6 +1381,15 @@ func newRoutingTestRuntime(t *testing.T, account int, recorder *driveRoutingReco
 	require.NoError(t, err)
 	runtimePacer := fs.NewPacer(context.Background(), pacer.NewGoogleDrive(pacer.MinSleep(0), pacer.Burst(1000)))
 	return newAccountRuntime(account, fmt.Sprintf("account-%d", account), client, svc, nil, runtimePacer, defaultUploadDailyLimit)
+}
+
+func routingTransportForRuntime(t *testing.T, runtime *accountRuntime) *driveRoutingTransport {
+	t.Helper()
+	require.NotNil(t, runtime)
+	require.NotNil(t, runtime.client)
+	transport, ok := runtime.client.Transport.(*driveRoutingTransport)
+	require.True(t, ok)
+	return transport
 }
 
 func newRoutingTestFs(t *testing.T, policy string, recorder *driveRoutingRecorder) *Fs {
@@ -1690,7 +1803,7 @@ func newTestFsForRetry(t *testing.T) *Fs {
 	return f
 }
 
-func TestReactiveUserRateLimitExceededSleepsOnlyCurrentAccount(t *testing.T) {
+func TestShouldRetryUploadUserRateLimitExceededReturnsAccountFailoverSignal(t *testing.T) {
 	runtime0 := newTestAccountRuntimeForPool(0, false, time.Time{})
 	runtime1 := newTestAccountRuntimeForPool(1, false, time.Time{})
 
@@ -1709,10 +1822,8 @@ func TestReactiveUserRateLimitExceededSleepsOnlyCurrentAccount(t *testing.T) {
 	}
 
 	sleepCalls := 0
-	var slept time.Duration
 	f.sleepFn = func(_ context.Context, d time.Duration) error {
 		sleepCalls++
-		slept = d
 		return nil
 	}
 
@@ -1726,18 +1837,55 @@ func TestReactiveUserRateLimitExceededSleepsOnlyCurrentAccount(t *testing.T) {
 
 	ctx := context.WithValue(context.Background(), accountRuntimeKey, runtime0)
 	retry, err := f.shouldRetryUpload(ctx, gerr, true)
-	require.True(t, retry)
-	require.Equal(t, gerr, err)
-	assert.Equal(t, 1, sleepCalls)
-	assert.Equal(t, time.Hour, slept)
+	require.False(t, retry)
+	require.True(t, isAccountUploadLimitError(err))
+	assert.ErrorIs(t, err, gerr)
+	assert.Zero(t, sleepCalls)
 
 	assert.Equal(t, time.Date(2026, 4, 16, 13, 0, 0, 0, time.UTC), runtime0.uploadSleepUntilUTC())
+	assert.True(t, runtime0.consumeQuotaResetOnNextSuccess())
 	assert.True(t, runtime1.uploadSleepUntilUTC().IsZero())
 
 	boundCtx, boundRuntime, bindErr := bindAccountForWriteObject(ctx, f)
 	require.NoError(t, bindErr)
 	assert.Same(t, runtime0, contextBoundRuntime(boundCtx))
 	assert.Same(t, runtime0, boundRuntime)
+}
+
+func TestReactiveNoPoolUserRateLimitExceededBehaviorRemainsLegacy(t *testing.T) {
+	f := newTestFsForRetry(t)
+	f.opt.SleepOnUploadLimit = true
+	sleepCalls := 0
+	f.sleepFn = func(context.Context, time.Duration) error {
+		sleepCalls++
+		return nil
+	}
+	gerr := &googleapi.Error{Code: 403, Errors: []googleapi.ErrorItem{{Reason: "userRateLimitExceeded", Message: "User rate limit exceeded."}}}
+
+	retry, err := f.shouldRetryUpload(context.Background(), gerr, true)
+	assert.True(t, retry)
+	assert.Equal(t, gerr, err)
+	assert.False(t, isAccountUploadLimitError(err))
+	assert.Equal(t, 1, sleepCalls)
+}
+
+func TestReactiveSingleAccountPoolUserRateLimitExceededBehaviorRemainsLegacy(t *testing.T) {
+	f := newTestFsForRetry(t)
+	f.opt.SleepOnUploadLimit = true
+	runtime := newTestAccountRuntimeForPool(0, false, time.Time{})
+	f.accountPool = &accountPool{accounts: []*accountRuntime{runtime}}
+	sleepCalls := 0
+	f.sleepFn = func(context.Context, time.Duration) error {
+		sleepCalls++
+		return nil
+	}
+	gerr := &googleapi.Error{Code: 403, Errors: []googleapi.ErrorItem{{Reason: "userRateLimitExceeded", Message: "User rate limit exceeded."}}}
+
+	retry, err := f.shouldRetryUpload(context.WithValue(context.Background(), accountRuntimeKey, runtime), gerr, true)
+	assert.True(t, retry)
+	assert.Equal(t, gerr, err)
+	assert.False(t, isAccountUploadLimitError(err))
+	assert.Equal(t, 1, sleepCalls)
 }
 
 func TestAllWriteAccountsSleepingWaitsThenResumes(t *testing.T) {
@@ -2210,22 +2358,38 @@ func TestShouldRetryUploadPathUserRateLimitExceededSleep(t *testing.T) {
 	assert.Equal(t, time.Hour, slept)
 }
 
-func TestPerAccountSleepRecoversAndResetsQuotaOnSuccessfulProbe(t *testing.T) {
+func TestNoteSuccessfulUploadBytesConsumesRuntimeQuotaResetBeforeAddingBytes(t *testing.T) {
+	runtime0 := newTestAccountRuntimeForPool(0, false, time.Time{})
+	runtime1 := newTestAccountRuntimeForPool(1, false, time.Time{})
+	now := time.Date(2026, 4, 16, 12, 0, 0, 0, time.UTC)
+	runtime0.state.dayStartUTC = utcDayStart(now)
+	runtime0.state.usedBytes = 123
+	runtime0.markUploadLimitSleep(now.Add(time.Hour))
+
+	f := &Fs{opt: Options{SleepOnUploadLimit: true, UploadDailyLimit: defaultUploadDailyLimit}, accountPool: &accountPool{accounts: []*accountRuntime{runtime0, runtime1}}}
+	ctx := context.WithValue(context.Background(), accountRuntimeKey, runtime0)
+
+	f.noteSuccessfulUploadBytes(ctx, now, 11)
+
+	runtime0.state.mu.RLock()
+	defer runtime0.state.mu.RUnlock()
+	assert.True(t, runtime0.state.uploadSleepUntilUTC.IsZero())
+	assert.Equal(t, int64(11), runtime0.state.usedBytes)
+	assert.False(t, runtime0.state.resetQuotaOnNextSuccessfulUpload)
+}
+
+func TestSingleAccountPooledLegacyProbeResetStillClearsQuotaOnSuccess(t *testing.T) {
 	runtime := newTestAccountRuntimeForPool(0, false, time.Time{})
+
+	now := time.Date(2026, 4, 16, 12, 0, 0, 0, time.UTC)
+	runtime.state.dayStartUTC = utcDayStart(now)
+	runtime.state.usedBytes = 123
+	runtime.state.uploadSleepUntilUTC = now.Add(time.Hour)
 
 	f := &Fs{
 		opt:         Options{SleepOnUploadLimit: true, UploadDailyLimit: defaultUploadDailyLimit},
 		accountPool: &accountPool{accounts: []*accountRuntime{runtime}},
 	}
-
-	now := time.Date(2026, 4, 16, 12, 0, 0, 0, time.UTC)
-	f.nowFn = func() time.Time { return now }
-
-	runtime.state.mu.Lock()
-	runtime.state.dayStartUTC = utcDayStart(now)
-	runtime.state.usedBytes = 123
-	runtime.state.uploadSleepUntilUTC = now.Add(time.Hour)
-	runtime.state.mu.Unlock()
 
 	ctx := context.WithValue(context.Background(), accountRuntimeKey, runtime)
 	ctx = withUploadProbeState(ctx)
@@ -2236,6 +2400,633 @@ func TestPerAccountSleepRecoversAndResetsQuotaOnSuccessfulProbe(t *testing.T) {
 	defer runtime.state.mu.RUnlock()
 	assert.True(t, runtime.state.uploadSleepUntilUTC.IsZero())
 	assert.Equal(t, int64(11), runtime.state.usedBytes)
+}
+
+func TestCheckUploadBudgetForAttemptMarksRuntimeForFailover(t *testing.T) {
+	now := time.Date(2026, 4, 16, 12, 0, 0, 0, time.UTC)
+	runtime0 := newTestAccountRuntimeForPool(0, false, time.Time{})
+	runtime1 := newTestAccountRuntimeForPool(1, false, time.Time{})
+	runtime0.uploadDailyLimit = 10 * fs.Mebi
+	runtime0.state.dayStartUTC = utcDayStart(now)
+	runtime0.state.usedBytes = int64(10 * fs.Mebi)
+
+	f := &Fs{opt: Options{SleepOnUploadLimit: true, UploadDailyLimit: 10 * fs.Mebi}, accountPool: &accountPool{accounts: []*accountRuntime{runtime0, runtime1}}, nowFn: func() time.Time { return now }}
+	ctx := context.WithValue(context.Background(), accountRuntimeKey, runtime0)
+
+	err := f.checkUploadBudgetForAttempt(ctx, 1)
+	assert.True(t, isAccountUploadLimitError(err))
+	assert.Equal(t, now.Add(time.Hour), runtime0.uploadSleepUntilUTC())
+	assert.True(t, runtime0.consumeQuotaResetOnNextSuccess())
+}
+
+func TestCheckUploadBudgetForAttemptAllowsExpiredProbeBeforeReset(t *testing.T) {
+	now := time.Date(2026, 4, 16, 13, 0, 0, 0, time.UTC)
+	runtime0 := newTestAccountRuntimeForPool(0, false, time.Time{})
+	runtime1 := newTestAccountRuntimeForPool(1, false, time.Time{})
+	runtime0.uploadDailyLimit = 10 * fs.Mebi
+	runtime0.state.dayStartUTC = utcDayStart(now)
+	runtime0.state.usedBytes = int64(10 * fs.Mebi)
+	runtime0.state.uploadSleepUntilUTC = now
+	runtime0.state.resetQuotaOnNextSuccessfulUpload = true
+
+	f := &Fs{opt: Options{SleepOnUploadLimit: true, UploadDailyLimit: 10 * fs.Mebi}, accountPool: &accountPool{accounts: []*accountRuntime{runtime0, runtime1}}, nowFn: func() time.Time { return now }}
+	ctx := context.WithValue(context.Background(), accountRuntimeKey, runtime0)
+
+	err := f.checkUploadBudgetForAttempt(ctx, 1)
+	assert.NoError(t, err)
+
+	runtime0.state.mu.RLock()
+	defer runtime0.state.mu.RUnlock()
+	assert.Equal(t, now, runtime0.state.uploadSleepUntilUTC)
+	assert.Equal(t, int64(10*fs.Mebi), runtime0.state.usedBytes)
+	assert.True(t, runtime0.state.resetQuotaOnNextSuccessfulUpload)
+}
+
+func TestCheckUploadBudgetForAttemptPreservesOversizedSignal(t *testing.T) {
+	now := time.Date(2026, 4, 16, 12, 0, 0, 0, time.UTC)
+	runtime0 := newTestAccountRuntimeForPool(0, false, time.Time{})
+	runtime1 := newTestAccountRuntimeForPool(1, false, time.Time{})
+	runtime0.uploadDailyLimit = 10 * fs.Mebi
+	runtime0.state.dayStartUTC = utcDayStart(now)
+
+	f := &Fs{opt: Options{SleepOnUploadLimit: true, UploadDailyLimit: 10 * fs.Mebi}, accountPool: &accountPool{accounts: []*accountRuntime{runtime0, runtime1}}, nowFn: func() time.Time { return now }}
+	ctx := context.WithValue(context.Background(), accountRuntimeKey, runtime0)
+
+	err := f.checkUploadBudgetForAttempt(ctx, 12*int64(fs.Mebi))
+	assert.True(t, isOversizedUploadLimitError(err))
+	assert.Equal(t, now.Add(durationUntilNextUTCDay(now)), runtime0.uploadSleepUntilUTC())
+
+	runtime0.state.mu.RLock()
+	defer runtime0.state.mu.RUnlock()
+	assert.False(t, runtime0.state.resetQuotaOnNextSuccessfulUpload)
+}
+
+func TestOversizedSignalPreservesRolloverProgressionWithoutHourlyProbeLoop(t *testing.T) {
+	now := time.Date(2026, 4, 16, 12, 0, 0, 0, time.UTC)
+	runtime0 := newTestAccountRuntimeForPool(0, false, time.Time{})
+	runtime1 := newTestAccountRuntimeForPool(1, false, time.Time{})
+	runtime0.uploadDailyLimit = 10 * fs.Mebi
+	runtime0.state.dayStartUTC = utcDayStart(now)
+
+	f := &Fs{opt: Options{SleepOnUploadLimit: true, UploadDailyLimit: 10 * fs.Mebi}, accountPool: &accountPool{accounts: []*accountRuntime{runtime0, runtime1}}, nowFn: func() time.Time { return now }}
+	ctx := context.WithValue(context.Background(), accountRuntimeKey, runtime0)
+
+	err := f.checkUploadBudgetForAttempt(ctx, 12*int64(fs.Mebi))
+	assert.True(t, isOversizedUploadLimitError(err))
+	assert.Equal(t, now.Add(durationUntilNextUTCDay(now)), runtime0.uploadSleepUntilUTC())
+	assert.NotEqual(t, now.Add(time.Hour), runtime0.uploadSleepUntilUTC())
+
+	now = now.Add(durationUntilNextUTCDay(now))
+	err = f.checkUploadBudgetForAttempt(ctx, 12*int64(fs.Mebi))
+	assert.NoError(t, err)
+	assert.True(t, runtime0.uploadSleepUntilUTC().IsZero())
+}
+
+func TestCheckUploadBudgetForAttemptAllowsOversizedAfterSingleRollover(t *testing.T) {
+	now := time.Date(2026, 4, 16, 12, 0, 0, 0, time.UTC)
+	runtime0 := newTestAccountRuntimeForPool(0, false, time.Time{})
+	runtime1 := newTestAccountRuntimeForPool(1, false, time.Time{})
+	runtime0.uploadDailyLimit = 10 * fs.Mebi
+	runtime0.state.dayStartUTC = utcDayStart(now)
+
+	f := &Fs{opt: Options{SleepOnUploadLimit: true, UploadDailyLimit: 10 * fs.Mebi}, accountPool: &accountPool{accounts: []*accountRuntime{runtime0, runtime1}}, nowFn: func() time.Time { return now }}
+	ctx := context.WithValue(context.Background(), accountRuntimeKey, runtime0)
+
+	err := f.checkUploadBudgetForAttempt(ctx, 12*int64(fs.Mebi))
+	assert.True(t, isOversizedUploadLimitError(err))
+	now = now.Add(24 * time.Hour)
+	err = f.checkUploadBudgetForAttempt(ctx, 12*int64(fs.Mebi))
+	assert.NoError(t, err)
+}
+
+func TestCheckUploadBudgetForAttemptDoesNotTreatExpiredHourlyProbeAsOversizedRollover(t *testing.T) {
+	now := time.Date(2026, 4, 16, 13, 0, 0, 0, time.UTC)
+	runtime0 := newTestAccountRuntimeForPool(0, false, time.Time{})
+	runtime1 := newTestAccountRuntimeForPool(1, false, time.Time{})
+	runtime0.uploadDailyLimit = 10 * fs.Mebi
+	runtime0.state.dayStartUTC = utcDayStart(now)
+	runtime0.state.usedBytes = int64(10 * fs.Mebi)
+	runtime0.state.uploadSleepUntilUTC = now
+	runtime0.state.resetQuotaOnNextSuccessfulUpload = true
+
+	f := &Fs{opt: Options{SleepOnUploadLimit: true, UploadDailyLimit: 10 * fs.Mebi}, accountPool: &accountPool{accounts: []*accountRuntime{runtime0, runtime1}}, nowFn: func() time.Time { return now }}
+	ctx := context.WithValue(context.Background(), accountRuntimeKey, runtime0)
+
+	err := f.checkUploadBudgetForAttempt(ctx, 12*int64(fs.Mebi))
+	assert.True(t, isOversizedUploadLimitError(err))
+	assert.Equal(t, now.Add(durationUntilNextUTCDay(now)), runtime0.uploadSleepUntilUTC())
+}
+
+func TestCheckUploadBudgetForChunkPreservesOversizedSignalForConcreteUnknownSizeChunk(t *testing.T) {
+	now := time.Date(2026, 4, 16, 12, 0, 0, 0, time.UTC)
+	runtime0 := newTestAccountRuntimeForPool(0, false, time.Time{})
+	runtime1 := newTestAccountRuntimeForPool(1, false, time.Time{})
+	runtime0.uploadDailyLimit = 1
+	runtime0.state.dayStartUTC = utcDayStart(now)
+
+	f := &Fs{opt: Options{SleepOnUploadLimit: true, UploadDailyLimit: 1}, accountPool: &accountPool{accounts: []*accountRuntime{runtime0, runtime1}}, nowFn: func() time.Time { return now }}
+	ctx := context.WithValue(context.Background(), accountRuntimeKey, runtime0)
+
+	err := f.checkUploadBudgetForChunk(ctx, 2)
+	assert.True(t, isOversizedUploadLimitError(err))
+	assert.False(t, isAccountUploadLimitError(err))
+	assert.Equal(t, now.Add(durationUntilNextUTCDay(now)), runtime0.uploadSleepUntilUTC())
+
+	runtime0.state.mu.RLock()
+	defer runtime0.state.mu.RUnlock()
+	assert.False(t, runtime0.state.resetQuotaOnNextSuccessfulUpload)
+}
+
+func TestCheckUploadBudgetForAttemptKeepsNoPoolBehaviorUnchanged(t *testing.T) {
+	f := &Fs{opt: Options{SleepOnUploadLimit: true, UploadDailyLimit: 10 * fs.Mebi}}
+	f.uploadBudget.dayStartUTC = utcDayStart(time.Now())
+	f.uploadBudget.usedBytes = int64(10 * fs.Mebi)
+
+	err := f.checkUploadBudgetForAttempt(context.Background(), 1)
+	assert.NoError(t, err)
+}
+
+func TestResumableUploadOneAttemptUsesFailoverSignalForWholeFileProactiveBudgetExhaustion(t *testing.T) {
+	now := time.Date(2026, 4, 16, 12, 0, 0, 0, time.UTC)
+	runtime0 := newTestAccountRuntimeForPool(0, false, time.Time{})
+	runtime1 := newTestAccountRuntimeForPool(1, false, time.Time{})
+	runtime0.uploadDailyLimit = 1
+	runtime0.state.dayStartUTC = utcDayStart(now)
+	runtime0.state.usedBytes = 1
+
+	f := &Fs{
+		opt: Options{SleepOnUploadLimit: true, UploadDailyLimit: 1, ChunkSize: 1},
+		accountPool: &accountPool{
+			accounts: []*accountRuntime{runtime0, runtime1},
+		},
+		nowFn: func() time.Time { return now },
+	}
+	ctx := context.WithValue(context.Background(), accountRuntimeKey, runtime0)
+	createInfo := &drive.File{Name: "file.txt", Parents: []string{"root"}, MimeType: "text/plain", ModifiedTime: now.Format(timeFormatOut)}
+
+	_, err := f.uploadOneAttempt(ctx, bytes.NewReader([]byte("x")), 1, "text/plain", "", "file.txt", createInfo)
+	assert.True(t, isAccountUploadLimitError(err))
+	assert.Equal(t, now.Add(time.Hour), runtime0.uploadSleepUntilUTC())
+	assert.True(t, runtime0.consumeQuotaResetOnNextSuccess())
+}
+
+func TestResumableUploadOneAttemptDoesNotOwnOuterFailover(t *testing.T) {
+	recorder := newDriveRoutingRecorder()
+	f := newRoutingTestFs(t, "round_robin", recorder)
+	f.opt.SleepOnUploadLimit = true
+	f.opt.UploadCutoff = 1
+	runtime0 := f.accountPool.accounts[0]
+	runtime0.uploadDailyLimit = 10 * fs.Mebi
+	runtime0.state.dayStartUTC = utcDayStart(time.Date(2026, 4, 16, 12, 0, 0, 0, time.UTC))
+	routingTransportForRuntime(t, runtime0).failChunkCall = 2
+
+	ctx := context.WithValue(context.Background(), accountRuntimeKey, runtime0)
+	createInfo := &drive.File{Name: "file.txt", Parents: []string{"root"}, MimeType: "text/plain", ModifiedTime: time.Date(2026, 4, 16, 12, 0, 0, 0, time.UTC).Format(timeFormatOut)}
+
+	_, err := f.uploadOneAttempt(ctx, bytes.NewReader([]byte("abc")), 3, "text/plain", "", "file.txt", createInfo)
+	assert.True(t, isAccountUploadLimitError(err))
+	assert.False(t, isOversizedUploadLimitError(err))
+	assert.Equal(t, []int{0}, recorder.accountsFor("upload.start"))
+	assert.Equal(t, []int{0, 0}, recorder.accountsFor("upload.chunk"))
+	assert.Empty(t, recorder.chunkRangesFor(1))
+}
+
+func TestResumableUploadOneAttemptChecksWholeFileBudgetBeforeAnyChunk(t *testing.T) {
+	recorder := newDriveRoutingRecorder()
+	f := newRoutingTestFs(t, "round_robin", recorder)
+	f.opt.SleepOnUploadLimit = true
+	f.opt.UploadCutoff = 1
+	now := time.Date(2026, 4, 16, 12, 0, 0, 0, time.UTC)
+	f.nowFn = func() time.Time { return now }
+	runtime0 := f.accountPool.accounts[0]
+	runtime0.uploadDailyLimit = 4
+	runtime0.state.dayStartUTC = utcDayStart(now)
+	runtime0.state.usedBytes = 2
+
+	ctx := context.WithValue(context.Background(), accountRuntimeKey, runtime0)
+	createInfo := &drive.File{Name: "file.txt", Parents: []string{"root"}, MimeType: "text/plain", ModifiedTime: now.Format(timeFormatOut)}
+
+	_, err := f.uploadOneAttempt(ctx, bytes.NewReader([]byte("abc")), 3, "text/plain", "", "file.txt", createInfo)
+	assert.True(t, isAccountUploadLimitError(err))
+	assert.Empty(t, recorder.accountsFor("upload.start"))
+	assert.Empty(t, recorder.accountsFor("upload.chunk"))
+}
+
+func TestResumableUploadOneAttemptPreservesWholeFileOversizedSignalBeforeAnyChunk(t *testing.T) {
+	recorder := newDriveRoutingRecorder()
+	f := newRoutingTestFs(t, "round_robin", recorder)
+	f.opt.SleepOnUploadLimit = true
+	f.opt.UploadCutoff = 1
+	now := time.Date(2026, 4, 16, 12, 0, 0, 0, time.UTC)
+	f.nowFn = func() time.Time { return now }
+	runtime0 := f.accountPool.accounts[0]
+	runtime0.uploadDailyLimit = 2
+	runtime0.state.dayStartUTC = utcDayStart(now)
+
+	ctx := context.WithValue(context.Background(), accountRuntimeKey, runtime0)
+	createInfo := &drive.File{Name: "file.txt", Parents: []string{"root"}, MimeType: "text/plain", ModifiedTime: now.Format(timeFormatOut)}
+
+	_, err := f.uploadOneAttempt(ctx, bytes.NewReader([]byte("abc")), 3, "text/plain", "", "file.txt", createInfo)
+	assert.True(t, isOversizedUploadLimitError(err))
+	assert.Empty(t, recorder.accountsFor("upload.start"))
+	assert.Empty(t, recorder.accountsFor("upload.chunk"))
+}
+
+func TestUnknownSizeResumableUploadOneAttemptPreservesOversizedSignalForOversizedChunk(t *testing.T) {
+	recorder := newDriveRoutingRecorder()
+	f := newRoutingTestFs(t, "round_robin", recorder)
+	f.opt.SleepOnUploadLimit = true
+	f.opt.UploadCutoff = 1
+	now := time.Date(2026, 4, 16, 12, 0, 0, 0, time.UTC)
+	f.nowFn = func() time.Time { return now }
+	runtime0 := f.accountPool.accounts[0]
+	runtime0.uploadDailyLimit = 1
+	runtime0.state.dayStartUTC = utcDayStart(now)
+
+	ctx := context.WithValue(context.Background(), accountRuntimeKey, runtime0)
+	createInfo := &drive.File{Name: "file.txt", Parents: []string{"root"}, MimeType: "text/plain", ModifiedTime: now.Format(timeFormatOut)}
+
+	_, err := f.uploadOneAttempt(ctx, bytes.NewReader([]byte("abc")), -1, "text/plain", "", "file.txt", createInfo)
+	assert.True(t, isOversizedUploadLimitError(err))
+	assert.False(t, isAccountUploadLimitError(err))
+	assert.Equal(t, []int{0}, recorder.accountsFor("upload.start"))
+	assert.Empty(t, recorder.accountsFor("upload.chunk"))
+	assert.Equal(t, now.Add(durationUntilNextUTCDay(now)), runtime0.uploadSleepUntilUTC())
+
+	runtime0.state.mu.RLock()
+	defer runtime0.state.mu.RUnlock()
+	assert.False(t, runtime0.state.resetQuotaOnNextSuccessfulUpload)
+}
+
+func TestUploadAttemptControllerClearsAttemptedSetOnNewRound(t *testing.T) {
+	f := newTestFsForRetry(t)
+	f.opt.SleepOnUploadLimit = true
+	runtime0 := newTestAccountRuntimeForPool(0, false, time.Time{})
+	runtime1 := newTestAccountRuntimeForPool(1, false, time.Time{})
+	f.accountPool = &accountPool{
+		accounts: []*accountRuntime{runtime0, runtime1},
+		nowFn:    f.nowFn,
+	}
+
+	var attempts []int
+	runs := 0
+	_, err := executeUploadWithAccountFailover(f, context.Background(), bytes.NewReader([]byte("abc")), func(attemptCtx context.Context, attemptIn io.Reader) (string, error) {
+		runtime := contextBoundRuntime(attemptCtx)
+		require.NotNil(t, runtime)
+		attempts = append(attempts, runtime.index)
+		runs++
+		if runs <= 3 {
+			return "", &accountUploadLimitError{cause: errors.New("quota"), wake: time.Time{}}
+		}
+		return "ok", nil
+	})
+	require.NoError(t, err)
+	assert.Equal(t, []int{0, 1, 0, 1}, attempts)
+}
+
+func TestUploadAttemptControllerWaitsForPoolWakeWhenNoAccountWritable(t *testing.T) {
+	now := time.Date(2026, 4, 16, 12, 0, 0, 0, time.UTC)
+	f := newTestFsForRetry(t)
+	f.opt.SleepOnUploadLimit = true
+	f.nowFn = func() time.Time { return now }
+	waits := 0
+	f.sleepFn = func(context.Context, time.Duration) error {
+		waits++
+		now = now.Add(time.Minute)
+		return nil
+	}
+	runtime0 := newTestAccountRuntimeForPool(0, false, now.Add(time.Minute))
+	runtime1 := newTestAccountRuntimeForPool(1, false, now.Add(2*time.Minute))
+	f.accountPool = &accountPool{
+		accounts: []*accountRuntime{runtime0, runtime1},
+		nowFn:    func() time.Time { return now },
+	}
+
+	result, err := executeUploadWithAccountFailover(f, context.Background(), bytes.NewReader([]byte("abc")), func(attemptCtx context.Context, attemptIn io.Reader) (string, error) {
+		runtime := contextBoundRuntime(attemptCtx)
+		require.NotNil(t, runtime)
+		return fmt.Sprintf("account-%d", runtime.index), nil
+	})
+	require.NoError(t, err)
+	assert.Equal(t, "account-0", result)
+	assert.Equal(t, 1, waits)
+}
+
+func TestUploadAttemptControllerEscalatesWhenInputNotRewindable(t *testing.T) {
+	f := newTestFsForRetry(t)
+	f.opt.SleepOnUploadLimit = true
+	runtime0 := newTestAccountRuntimeForPool(0, false, time.Time{})
+	runtime1 := newTestAccountRuntimeForPool(1, false, time.Time{})
+	f.accountPool = &accountPool{
+		accounts: []*accountRuntime{runtime0, runtime1},
+		nowFn:    f.nowFn,
+	}
+
+	_, err := executeUploadWithAccountFailover(f, context.Background(), io.NopCloser(strings.NewReader("abc")), func(attemptCtx context.Context, attemptIn io.Reader) (string, error) {
+		return "", &accountUploadLimitError{cause: errors.New("quota"), wake: time.Time{}}
+	})
+	require.Error(t, err)
+	assert.True(t, fserrors.IsRetryError(err))
+	assert.False(t, isAccountUploadLimitError(err))
+}
+
+func TestPutUncheckedUsesAnotherAccountAfterReactiveUploadLimit(t *testing.T) {
+	recorder := newDriveRoutingRecorder()
+	f := newRoutingTestFs(t, "round_robin", recorder)
+	f.opt.SleepOnUploadLimit = true
+	f.opt.UploadCutoff = 1
+	routingTransportForRuntime(t, f.accountPool.accounts[0]).failUploadStart = true
+
+	src := object.NewStaticObjectInfo("file.txt", time.Date(2026, 4, 17, 0, 0, 0, 0, time.UTC), 3, true, nil, nil).WithMimeType("text/plain")
+
+	obj, err := f.PutUnchecked(context.Background(), bytes.NewReader([]byte("abc")), src)
+	require.NoError(t, err)
+	require.NotNil(t, obj)
+	assert.Equal(t, []int{0, 1}, recorder.accountsFor("upload.start"))
+	assert.Equal(t, []int{1, 1}, recorder.accountsFor("upload.chunk"))
+}
+
+func TestBaseObjectUpdateUsesAnotherAccountAfterProactiveBudgetExhaustion(t *testing.T) {
+	recorder := newDriveRoutingRecorder()
+	f := newRoutingTestFs(t, "round_robin", recorder)
+	f.opt.SleepOnUploadLimit = true
+	f.opt.UploadCutoff = 16
+	f.opt.UploadDailyLimit = 10 * fs.Mebi
+	now := time.Date(2026, 4, 16, 12, 0, 0, 0, time.UTC)
+	f.nowFn = func() time.Time { return now }
+	runtime0 := f.accountPool.accounts[0]
+	runtime1 := f.accountPool.accounts[1]
+	runtime0.uploadDailyLimit = 1
+	runtime0.state.dayStartUTC = utcDayStart(now)
+	runtime0.state.usedBytes = 1
+	runtime1.uploadDailyLimit = 1 * fs.Mebi
+
+	obj := &Object{baseObject: baseObject{fs: f, remote: "file.txt", id: "obj-1", mimeType: "text/plain"}}
+	src := object.NewStaticObjectInfo("file.txt", time.Date(2026, 4, 17, 0, 0, 0, 0, time.UTC), 1, true, nil, nil).WithMimeType("text/plain")
+
+	err := obj.Update(context.Background(), bytes.NewReader([]byte("a")), src)
+	require.NoError(t, err)
+	assert.Equal(t, []int{1}, recorder.accountsFor("files.update"))
+	assert.Equal(t, now.Add(time.Hour), runtime0.uploadSleepUntilUTC())
+	assert.True(t, runtime1.uploadSleepUntilUTC().IsZero())
+}
+
+func TestDirectSmallUploadDoesNotSleepInPlaceOnProactiveBudgetExhaustion(t *testing.T) {
+	recorder := newDriveRoutingRecorder()
+	f := newRoutingTestFs(t, "round_robin", recorder)
+	f.opt.SleepOnUploadLimit = true
+	f.opt.UploadCutoff = 16
+	now := time.Date(2026, 4, 16, 12, 0, 0, 0, time.UTC)
+	f.nowFn = func() time.Time { return now }
+	sleepCalls := 0
+	f.sleepFn = func(context.Context, time.Duration) error {
+		sleepCalls++
+		return nil
+	}
+	runtime0 := f.accountPool.accounts[0]
+	runtime1 := f.accountPool.accounts[1]
+	runtime0.uploadDailyLimit = 1
+	runtime0.state.dayStartUTC = utcDayStart(now)
+	runtime0.state.usedBytes = 1
+	runtime1.uploadDailyLimit = 1 * fs.Mebi
+
+	src := object.NewStaticObjectInfo("file.txt", time.Date(2026, 4, 17, 0, 0, 0, 0, time.UTC), 1, true, nil, nil).WithMimeType("text/plain")
+
+	obj, err := f.PutUnchecked(context.Background(), bytes.NewReader([]byte("a")), src)
+	require.NoError(t, err)
+	require.NotNil(t, obj)
+	assert.Equal(t, []int{1}, recorder.accountsFor("files.create"))
+	assert.Zero(t, sleepCalls)
+	assert.Equal(t, now.Add(time.Hour), runtime0.uploadSleepUntilUTC())
+}
+
+func TestResumableUploadRestartsFromZeroOnAccountFailover(t *testing.T) {
+	recorder := newDriveRoutingRecorder()
+	f := newRoutingTestFs(t, "round_robin", recorder)
+	f.opt.SleepOnUploadLimit = true
+	f.opt.UploadCutoff = 1
+	routingTransportForRuntime(t, f.accountPool.accounts[0]).failChunkCall = 2
+
+	src := object.NewStaticObjectInfo("file.txt", time.Date(2026, 4, 17, 0, 0, 0, 0, time.UTC), 3, true, nil, nil).WithMimeType("text/plain")
+
+	obj, err := f.PutUnchecked(context.Background(), bytes.NewReader([]byte("abc")), src)
+	require.NoError(t, err)
+	require.NotNil(t, obj)
+	assert.Equal(t, []int{0, 1}, recorder.accountsFor("upload.start"))
+	assert.Equal(t, []int{0, 0, 1, 1}, recorder.accountsFor("upload.chunk"))
+	assert.Equal(t, []string{"bytes 0-1/3", "bytes 2-2/3"}, recorder.chunkRangesFor(0))
+	assert.Equal(t, []string{"bytes 0-1/3", "bytes 2-2/3"}, recorder.chunkRangesFor(1))
+}
+
+func TestUnknownSizeResumableUploadFailsOverAfterOversizedChunkWithoutInPlaceSleep(t *testing.T) {
+	recorder := newDriveRoutingRecorder()
+	f := newRoutingTestFs(t, "round_robin", recorder)
+	f.opt.SleepOnUploadLimit = true
+	f.opt.UploadCutoff = 1
+	now := time.Date(2026, 4, 16, 12, 0, 0, 0, time.UTC)
+	f.nowFn = func() time.Time { return now }
+	sleepCalls := 0
+	f.sleepFn = func(context.Context, time.Duration) error {
+		sleepCalls++
+		return nil
+	}
+	runtime0 := f.accountPool.accounts[0]
+	runtime1 := f.accountPool.accounts[1]
+	runtime0.uploadDailyLimit = 1
+	runtime0.state.dayStartUTC = utcDayStart(now)
+	runtime1.uploadDailyLimit = 10 * fs.Mebi
+
+	src := object.NewStaticObjectInfo("file.txt", time.Date(2026, 4, 17, 0, 0, 0, 0, time.UTC), -1, true, nil, nil).WithMimeType("text/plain")
+
+	obj, err := f.PutUnchecked(context.Background(), bytes.NewReader([]byte("abc")), src)
+	require.NoError(t, err)
+	require.NotNil(t, obj)
+	assert.Equal(t, []int{0, 1}, recorder.accountsFor("upload.start"))
+	assert.Equal(t, []int{1, 1}, recorder.accountsFor("upload.chunk"))
+	assert.Empty(t, recorder.chunkRangesFor(0))
+	assert.Equal(t, []string{"bytes 0-1/*", "bytes 2-2/3"}, recorder.chunkRangesFor(1))
+	assert.Zero(t, sleepCalls)
+	assert.Equal(t, now.Add(durationUntilNextUTCDay(now)), runtime0.uploadSleepUntilUTC())
+
+	runtime0.state.mu.RLock()
+	defer runtime0.state.mu.RUnlock()
+	assert.False(t, runtime0.state.resetQuotaOnNextSuccessfulUpload)
+}
+
+func TestUnknownSizeResumableUploadFailsOverBeforeFinalChunkSend(t *testing.T) {
+	recorder := newDriveRoutingRecorder()
+	f := newRoutingTestFs(t, "round_robin", recorder)
+	f.opt.SleepOnUploadLimit = true
+	f.opt.UploadCutoff = 1
+	currentDay := time.Now().UTC()
+	now := time.Date(currentDay.Year(), currentDay.Month(), currentDay.Day(), 12, 0, 0, 0, time.UTC)
+	f.nowFn = func() time.Time { return now }
+	sleepCalls := 0
+	f.sleepFn = func(context.Context, time.Duration) error {
+		sleepCalls++
+		return nil
+	}
+	runtime0 := f.accountPool.accounts[0]
+	runtime1 := f.accountPool.accounts[1]
+	runtime0.uploadDailyLimit = 2
+	runtime0.state.dayStartUTC = utcDayStart(now)
+	runtime1.uploadDailyLimit = 10 * fs.Mebi
+
+	src := object.NewStaticObjectInfo("file.txt", time.Date(2026, 4, 17, 0, 0, 0, 0, time.UTC), -1, true, nil, nil).WithMimeType("text/plain")
+
+	obj, err := f.PutUnchecked(context.Background(), bytes.NewReader([]byte("abc")), src)
+	require.NoError(t, err)
+	require.NotNil(t, obj)
+	assert.Equal(t, []int{0, 1}, recorder.accountsFor("upload.start"))
+	assert.Equal(t, []int{0, 1, 1}, recorder.accountsFor("upload.chunk"))
+	assert.Equal(t, []string{"bytes 0-1/*"}, recorder.chunkRangesFor(0))
+	assert.Equal(t, []string{"bytes 0-1/*", "bytes 2-2/3"}, recorder.chunkRangesFor(1))
+	assert.Zero(t, sleepCalls)
+	assert.Equal(t, now.Add(time.Hour), runtime0.uploadSleepUntilUTC())
+	assert.True(t, runtime0.consumeQuotaResetOnNextSuccess())
+}
+
+func TestNoPoolUploadBudgetBehaviorRemainsUnchanged(t *testing.T) {
+	now := time.Date(2026, 4, 16, 12, 0, 0, 0, time.UTC)
+	f := &Fs{
+		opt: Options{SleepOnUploadLimit: true, UploadDailyLimit: 10 * fs.Mebi},
+		nowFn: func() time.Time {
+			return now
+		},
+	}
+	f.uploadBudget.dayStartUTC = utcDayStart(now)
+	f.uploadBudget.usedBytes = 10 * int64(fs.Mebi)
+
+	assert.False(t, f.usesUploadAccountFailover())
+	assert.NoError(t, f.checkUploadBudgetForAttempt(context.Background(), 1))
+
+	var waits []time.Duration
+	err := f.waitForUploadBudget(context.Background(), 1, func(d time.Duration) error {
+		waits = append(waits, d)
+		return context.Canceled
+	})
+	require.ErrorIs(t, err, context.Canceled)
+	assert.Equal(t, []time.Duration{time.Hour}, waits)
+	assert.Equal(t, int64(10*fs.Mebi), f.uploadBudget.usedBytes)
+}
+
+func TestSleepOnUploadLimitFalseDoesNotEnableAccountFailover(t *testing.T) {
+	now := time.Date(2026, 4, 16, 12, 0, 0, 0, time.UTC)
+	runtime0 := newTestAccountRuntimeForPool(0, false, time.Time{})
+	runtime1 := newTestAccountRuntimeForPool(1, false, time.Time{})
+	runtime0.uploadDailyLimit = 1
+	runtime0.state.dayStartUTC = utcDayStart(now)
+	runtime0.state.usedBytes = 1
+
+	f := &Fs{
+		opt: Options{SleepOnUploadLimit: false, UploadDailyLimit: 1},
+		accountPool: &accountPool{
+			accounts: []*accountRuntime{runtime0, runtime1},
+		},
+		nowFn: func() time.Time {
+			return now
+		},
+	}
+	ctx := context.WithValue(context.Background(), accountRuntimeKey, runtime0)
+
+	assert.False(t, f.usesUploadAccountFailover())
+	assert.NoError(t, f.checkUploadBudgetForAttempt(ctx, 1))
+
+	gerr := &googleapi.Error{Code: 403, Errors: []googleapi.ErrorItem{{Reason: "userRateLimitExceeded", Message: "User rate limit exceeded."}}}
+	retry, err := f.shouldRetryUpload(ctx, gerr, true)
+	assert.True(t, retry)
+	assert.Equal(t, gerr, err)
+	assert.False(t, isAccountUploadLimitError(err))
+	assert.True(t, runtime0.uploadSleepUntilUTC().IsZero())
+	assert.True(t, runtime1.uploadSleepUntilUTC().IsZero())
+}
+
+func TestSingleAccountPoolDoesNotEnableFileLevelFailover(t *testing.T) {
+	now := time.Date(2026, 4, 16, 12, 0, 0, 0, time.UTC)
+	runtime := newTestAccountRuntimeForPool(0, false, time.Time{})
+	runtime.uploadDailyLimit = 1
+	runtime.state.dayStartUTC = utcDayStart(now)
+	runtime.state.usedBytes = 1
+
+	f := &Fs{
+		opt: Options{SleepOnUploadLimit: true, UploadDailyLimit: 1},
+		accountPool: &accountPool{
+			accounts: []*accountRuntime{runtime},
+		},
+		nowFn: func() time.Time {
+			return now
+		},
+	}
+	sleepCalls := 0
+	f.sleepFn = func(context.Context, time.Duration) error {
+		sleepCalls++
+		return nil
+	}
+	ctx, boundRuntime, err := bindAccountForWriteObject(context.Background(), f)
+	require.NoError(t, err)
+	require.Same(t, runtime, boundRuntime)
+
+	assert.False(t, f.usesUploadAccountFailover())
+	assert.NoError(t, f.checkUploadBudgetForAttempt(ctx, 1))
+
+	gerr := &googleapi.Error{Code: 403, Errors: []googleapi.ErrorItem{{Reason: "userRateLimitExceeded", Message: "User rate limit exceeded."}}}
+	retry, err := f.shouldRetryUpload(ctx, gerr, true)
+	assert.True(t, retry)
+	assert.Equal(t, gerr, err)
+	assert.False(t, isAccountUploadLimitError(err))
+	assert.Equal(t, 1, sleepCalls)
+	assert.Equal(t, now.Add(time.Hour), runtime.uploadSleepUntilUTC())
+}
+
+func TestOversizedUploadBehaviorRemainsExplicitForCoveredPoolPath(t *testing.T) {
+	initialNow := time.Date(2026, 4, 16, 12, 0, 0, 0, time.UTC)
+	now := initialNow
+	rolloverWait := durationUntilNextUTCDay(initialNow)
+	runtime0 := newTestAccountRuntimeForPool(0, false, time.Time{})
+	runtime1 := newTestAccountRuntimeForPool(1, false, time.Time{})
+	runtime0.uploadDailyLimit = 2
+	runtime1.uploadDailyLimit = 2
+	runtime0.state.dayStartUTC = utcDayStart(now)
+	runtime1.state.dayStartUTC = utcDayStart(now)
+	pool := newAccountPool("round_robin", []*accountRuntime{runtime0, runtime1})
+	pool.nowFn = func() time.Time { return now }
+
+	f := &Fs{
+		opt:         Options{SleepOnUploadLimit: true, UploadDailyLimit: 2},
+		accountPool: pool,
+		nowFn: func() time.Time {
+			return now
+		},
+	}
+	var waits []time.Duration
+	f.sleepFn = func(_ context.Context, d time.Duration) error {
+		waits = append(waits, d)
+		now = now.Add(d)
+		return nil
+	}
+
+	var attempts []int
+	oversizedSignals := 0
+	result, err := executeUploadWithAccountFailover(f, context.Background(), bytes.NewReader([]byte("abc")), func(attemptCtx context.Context, attemptIn io.Reader) (int, error) {
+		runtime := contextBoundRuntime(attemptCtx)
+		require.NotNil(t, runtime)
+		attempts = append(attempts, runtime.index)
+		err := f.checkUploadBudgetForAttempt(attemptCtx, 3)
+		if err != nil {
+			assert.True(t, isOversizedUploadLimitError(err))
+			assert.False(t, isAccountUploadLimitError(err))
+			oversizedSignals++
+			return -1, err
+		}
+		return runtime.index, nil
+	})
+	require.NoError(t, err)
+	assert.Equal(t, 0, result)
+	assert.Equal(t, []int{0, 1, 0}, attempts)
+	assert.Equal(t, 2, oversizedSignals)
+	assert.Equal(t, []time.Duration{rolloverWait}, waits)
+	assert.True(t, runtime0.uploadSleepUntilUTC().IsZero())
+	assert.Equal(t, initialNow.Add(rolloverWait), runtime1.uploadSleepUntilUTC())
 }
 
 func TestBudgetSleepSuccessBeforeWakeDoesNotResetOrClearSleep(t *testing.T) {

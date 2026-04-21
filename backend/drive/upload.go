@@ -54,8 +54,15 @@ type resumableUpload struct {
 
 // Upload the io.Reader in of size bytes with contentType and info
 func (f *Fs) Upload(ctx context.Context, in io.Reader, size int64, contentType, fileID, remote string, info *drive.File) (*drive.File, error) {
+	return f.uploadOneAttempt(ctx, in, size, contentType, fileID, remote, info)
+}
+
+func (f *Fs) uploadOneAttempt(ctx context.Context, in io.Reader, size int64, contentType, fileID, remote string, info *drive.File) (*drive.File, error) {
 	ctx, _, err := bindAccountForWriteObject(ctx, f)
 	if err != nil {
+		return nil, err
+	}
+	if err := f.checkUploadBudgetForAttempt(ctx, size); err != nil {
 		return nil, err
 	}
 	pacerInstance, err := f.pacerFor(ctx)
@@ -189,6 +196,7 @@ func (rx *resumableUpload) Upload(ctx context.Context) (*drive.File, error) {
 	for finished := false; !finished; {
 		var reqSize int64
 		var chunk io.ReadSeeker
+		unknownSizeChunk := rx.ContentLength < 0
 		if rx.ContentLength >= 0 {
 			// If size known use repeatable reader for smoother bwlimit
 			if start >= rx.ContentLength {
@@ -212,10 +220,16 @@ func (rx *resumableUpload) Upload(ctx context.Context) (*drive.File, error) {
 			chunk = bytes.NewReader(buf[:reqSize])
 		}
 
-		if err := rx.f.waitForUploadBudget(ctx, reqSize, func(d time.Duration) error {
-			return sleepWithContext(ctx, d)
-		}); err != nil {
-			return nil, err
+		if !rx.f.usesUploadAccountFailover() || rx.f.boundUploadBudgetRuntime(ctx) == nil {
+			if err := rx.f.waitForUploadBudget(ctx, reqSize, func(d time.Duration) error {
+				return sleepWithContext(ctx, d)
+			}); err != nil {
+				return nil, err
+			}
+		} else if unknownSizeChunk {
+			if err := rx.f.checkUploadBudgetForChunk(ctx, reqSize); err != nil {
+				return nil, err
+			}
 		}
 
 		// Transfer the chunk
