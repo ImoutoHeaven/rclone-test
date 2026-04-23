@@ -28,6 +28,7 @@ import (
 	"time"
 
 	"github.com/rclone/rclone/fs"
+	"github.com/rclone/rclone/fs/accounting"
 	"github.com/rclone/rclone/fs/cache"
 	"github.com/rclone/rclone/fs/config"
 	"github.com/rclone/rclone/fs/config/configmap"
@@ -2143,12 +2144,107 @@ func (f *Fs) checkUploadBudget(ctx context.Context, want int64, allowOversized b
 
 type uploadAttemptRunner[T any] func(context.Context, io.Reader) (T, error)
 
+type uploadAttemptInput interface {
+	newAttemptReader(context.Context) (io.Reader, error)
+}
+
+type seekableUploadAttemptInput struct {
+	reader io.Reader
+	seeker io.Seeker
+}
+
+type singleUseUploadAttemptInput struct {
+	reader io.Reader
+	used   bool
+}
+
+type singleUseAccountingUploadAttemptInput struct {
+	account *accounting.Account
+	used    bool
+}
+
+type accountingUploadAttemptInput struct {
+	account    *accounting.Account
+	underlying uploadAttemptInput
+}
+
+func (s *seekableUploadAttemptInput) newAttemptReader(context.Context) (io.Reader, error) {
+	_, err := s.seeker.Seek(0, io.SeekStart)
+	if err != nil {
+		return nil, fserrors.RetryErrorf("upload must be retried to switch accounts")
+	}
+	return s.reader, nil
+}
+
+func (s *singleUseUploadAttemptInput) newAttemptReader(context.Context) (io.Reader, error) {
+	if s.used {
+		return nil, fserrors.RetryErrorf("upload must be retried to switch accounts")
+	}
+	s.used = true
+	return s.reader, nil
+}
+
+func (s *singleUseAccountingUploadAttemptInput) newAttemptReader(context.Context) (io.Reader, error) {
+	if s.used {
+		if asyncReader := s.account.GetAsyncReader(); asyncReader != nil {
+			asyncReader.Abandon()
+		}
+		return nil, fserrors.RetryErrorf("upload must be retried to switch accounts")
+	}
+	s.used = true
+	return s.account, nil
+}
+
+func (a *accountingUploadAttemptInput) newAttemptReader(ctx context.Context) (io.Reader, error) {
+	if asyncReader := a.account.GetAsyncReader(); asyncReader != nil {
+		asyncReader.Abandon()
+	}
+	underlyingReader, err := a.underlying.newAttemptReader(ctx)
+	if err != nil {
+		return nil, err
+	}
+	underlyingReadCloser, ok := underlyingReader.(io.ReadCloser)
+	if !ok {
+		return nil, fserrors.RetryErrorf("upload must be retried to switch accounts")
+	}
+	a.account.UpdateReader(ctx, underlyingReadCloser)
+	return a.account, nil
+}
+
+func newUploadAttemptInputFromAccounting(acc *accounting.Account) (uploadAttemptInput, error) {
+	underlyingInput, err := newUploadAttemptInput(acc.GetReader())
+	if err != nil {
+		return nil, err
+	}
+	if _, ok := underlyingInput.(*singleUseUploadAttemptInput); ok {
+		return &singleUseAccountingUploadAttemptInput{account: acc}, nil
+	}
+	return &accountingUploadAttemptInput{account: acc, underlying: underlyingInput}, nil
+}
+
+func newUploadAttemptInput(in io.Reader) (uploadAttemptInput, error) {
+	if attemptInput, ok := in.(uploadAttemptInput); ok {
+		return attemptInput, nil
+	}
+	if acc, ok := in.(*accounting.Account); ok {
+		return newUploadAttemptInputFromAccounting(acc)
+	}
+	seeker, ok := in.(io.Seeker)
+	if !ok {
+		return &singleUseUploadAttemptInput{reader: in}, nil
+	}
+	return &seekableUploadAttemptInput{reader: in, seeker: seeker}, nil
+}
+
 func executeUploadWithAccountFailover[T any](f *Fs, ctx context.Context, in io.Reader, run uploadAttemptRunner[T]) (T, error) {
 	var zero T
 	if !f.usesUploadAccountFailover() {
 		return run(ctx, in)
 	}
-	seeker, rewindable := in.(io.Seeker)
+	attemptInput, err := newUploadAttemptInput(in)
+	if err != nil {
+		return zero, err
+	}
 	attempted := map[int]struct{}{}
 	for {
 		runtime, outcome, wait, err := f.accountPool.selectWriteAccountForRound(attempted)
@@ -2178,18 +2274,16 @@ func executeUploadWithAccountFailover[T any](f *Fs, ctx context.Context, in io.R
 		}
 		attempted[runtime.index] = struct{}{}
 		attemptCtx := context.WithValue(contextOrBackground(ctx), accountRuntimeKey, runtime)
-		result, err := run(attemptCtx, in)
+		attemptReader, err := attemptInput.newAttemptReader(attemptCtx)
+		if err != nil {
+			return zero, err
+		}
+		result, err := run(attemptCtx, attemptReader)
 		if err == nil {
 			return result, nil
 		}
 		if !isAccountUploadLimitError(err) && !isOversizedUploadLimitError(err) {
 			return zero, err
-		}
-		if !rewindable {
-			return zero, fserrors.RetryErrorf("upload must be retried to switch accounts")
-		}
-		if _, seekErr := seeker.Seek(0, io.SeekStart); seekErr != nil {
-			return zero, fserrors.RetryErrorf("upload must be retried to switch accounts")
 		}
 	}
 }

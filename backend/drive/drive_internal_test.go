@@ -21,6 +21,8 @@ import (
 
 	_ "github.com/rclone/rclone/backend/local"
 	"github.com/rclone/rclone/fs"
+	"github.com/rclone/rclone/fs/accounting"
+	"github.com/rclone/rclone/fs/asyncreader"
 	"github.com/rclone/rclone/fs/config"
 	"github.com/rclone/rclone/fs/config/configmap"
 	"github.com/rclone/rclone/fs/filter"
@@ -31,6 +33,7 @@ import (
 	fssync "github.com/rclone/rclone/fs/sync"
 	"github.com/rclone/rclone/fstest"
 	"github.com/rclone/rclone/fstest/fstests"
+	"github.com/rclone/rclone/fstest/mockobject"
 	"github.com/rclone/rclone/lib/dircache"
 	"github.com/rclone/rclone/lib/pacer"
 	"github.com/rclone/rclone/lib/random"
@@ -2712,6 +2715,181 @@ func TestUploadAttemptControllerWaitsForPoolWakeWhenNoAccountWritable(t *testing
 	assert.Equal(t, 1, waits)
 }
 
+type replayableAttemptInputStub struct {
+	attempts int
+	payload  []byte
+	reader   io.Reader
+}
+
+func newReplayableAttemptInputStub(payload []byte) *replayableAttemptInputStub {
+	clonedPayload := append([]byte(nil), payload...)
+	return &replayableAttemptInputStub{
+		payload: clonedPayload,
+		reader:  bytes.NewReader(clonedPayload),
+	}
+}
+
+func (s *replayableAttemptInputStub) Read(p []byte) (int, error) {
+	return s.reader.Read(p)
+}
+
+func (s *replayableAttemptInputStub) newAttemptReader(context.Context) (io.Reader, error) {
+	s.attempts++
+	return bytes.NewReader(s.payload), nil
+}
+
+func TestExecuteUploadWithAccountFailoverUsesReplayableAttemptInput(t *testing.T) {
+	f := newTestFsForRetry(t)
+	f.opt.SleepOnUploadLimit = true
+	runtime0 := newTestAccountRuntimeForPool(0, false, time.Time{})
+	runtime1 := newTestAccountRuntimeForPool(1, false, time.Time{})
+	f.accountPool = &accountPool{
+		accounts: []*accountRuntime{runtime0, runtime1},
+		nowFn:    f.nowFn,
+	}
+
+	stub := newReplayableAttemptInputStub([]byte("abc"))
+	var attemptPayloads []string
+	runs := 0
+
+	result, err := executeUploadWithAccountFailover(f, context.Background(), stub, func(attemptCtx context.Context, attemptIn io.Reader) (string, error) {
+		runtime := contextBoundRuntime(attemptCtx)
+		require.NotNil(t, runtime)
+		payload, readErr := io.ReadAll(attemptIn)
+		require.NoError(t, readErr)
+		attemptPayloads = append(attemptPayloads, string(payload))
+		runs++
+		if runs == 1 {
+			return "", &accountUploadLimitError{cause: errors.New("quota"), wake: time.Time{}}
+		}
+		return fmt.Sprintf("account-%d", runtime.index), nil
+	})
+	require.NoError(t, err)
+	assert.Equal(t, "account-1", result)
+	assert.Equal(t, 2, stub.attempts)
+	assert.Equal(t, []string{"abc", "abc"}, attemptPayloads)
+}
+
+func TestExecuteUploadWithAccountFailoverRewindsDirectSeekableInput(t *testing.T) {
+	f := newTestFsForRetry(t)
+	f.opt.SleepOnUploadLimit = true
+	runtime0 := newTestAccountRuntimeForPool(0, false, time.Time{})
+	runtime1 := newTestAccountRuntimeForPool(1, false, time.Time{})
+	f.accountPool = &accountPool{
+		accounts: []*accountRuntime{runtime0, runtime1},
+		nowFn:    f.nowFn,
+	}
+
+	in := bytes.NewReader([]byte("abc"))
+	var attemptPayloads []string
+	runs := 0
+
+	result, err := executeUploadWithAccountFailover(f, context.Background(), in, func(attemptCtx context.Context, attemptIn io.Reader) (string, error) {
+		runtime := contextBoundRuntime(attemptCtx)
+		require.NotNil(t, runtime)
+		payload, readErr := io.ReadAll(attemptIn)
+		require.NoError(t, readErr)
+		attemptPayloads = append(attemptPayloads, string(payload))
+		runs++
+		if runs == 1 {
+			return "", &accountUploadLimitError{cause: errors.New("quota"), wake: time.Time{}}
+		}
+		return fmt.Sprintf("account-%d", runtime.index), nil
+	})
+	require.NoError(t, err)
+	assert.Equal(t, "account-1", result)
+	assert.Equal(t, []string{"abc", "abc"}, attemptPayloads)
+}
+
+func TestExecuteUploadWithAccountFailoverUnwrapsBufferedAccountingReader(t *testing.T) {
+	ctx, ci := fs.AddConfig(context.Background())
+	ctx = accounting.WithStatsGroup(ctx, t.Name())
+	ci.BufferSize = fs.SizeSuffix(asyncreader.BufferSize)
+
+	f := newTestFsForRetry(t)
+	f.opt.SleepOnUploadLimit = true
+	runtime0 := newTestAccountRuntimeForPool(0, false, time.Time{})
+	runtime1 := newTestAccountRuntimeForPool(1, false, time.Time{})
+	f.accountPool = &accountPool{
+		accounts: []*accountRuntime{runtime0, runtime1},
+		nowFn:    f.nowFn,
+	}
+
+	payload := append([]byte("abc"), bytes.Repeat([]byte{'z'}, asyncreader.BufferSize)...)
+	src := mockobject.New("wrapped.txt").WithContent(payload, mockobject.SeekModeRange)
+	replayableIn, err := operations.NewReOpen(ctx, src, 10)
+	require.NoError(t, err)
+
+	transfer := accounting.Stats(ctx).NewTransferRemoteSize("wrapped.txt", int64(len(payload)), nil, nil)
+	defer transfer.Done(ctx, nil)
+	bufferedAccount := transfer.Account(ctx, replayableIn).WithBuffer()
+	require.NotNil(t, bufferedAccount.GetAsyncReader())
+
+	var attemptPayloads []string
+	runs := 0
+
+	result, err := executeUploadWithAccountFailover(f, ctx, bufferedAccount, func(attemptCtx context.Context, attemptIn io.Reader) (string, error) {
+		runtime := contextBoundRuntime(attemptCtx)
+		require.NotNil(t, runtime)
+
+		chunk := make([]byte, 3)
+		_, readErr := io.ReadFull(attemptIn, chunk)
+		require.NoError(t, readErr)
+		attemptPayloads = append(attemptPayloads, string(chunk))
+
+		runs++
+		if runs == 1 {
+			return "", &accountUploadLimitError{cause: errors.New("quota"), wake: time.Time{}}
+		}
+		return fmt.Sprintf("account-%d", runtime.index), nil
+	})
+	require.NoError(t, err)
+	assert.Equal(t, "account-1", result)
+	assert.Equal(t, []string{"abc", "abc"}, attemptPayloads)
+	assert.NotNil(t, bufferedAccount.GetAsyncReader())
+}
+
+func TestExecuteUploadWithAccountFailoverEscalatesWhenBufferedAccountingReaderIsNotReplayable(t *testing.T) {
+	ctx, ci := fs.AddConfig(context.Background())
+	ctx = accounting.WithStatsGroup(ctx, t.Name())
+	ci.BufferSize = fs.SizeSuffix(asyncreader.BufferSize)
+
+	f := newTestFsForRetry(t)
+	f.opt.SleepOnUploadLimit = true
+	runtime0 := newTestAccountRuntimeForPool(0, false, time.Time{})
+	runtime1 := newTestAccountRuntimeForPool(1, false, time.Time{})
+	f.accountPool = &accountPool{
+		accounts: []*accountRuntime{runtime0, runtime1},
+		nowFn:    f.nowFn,
+	}
+
+	payload := append([]byte("abc"), bytes.Repeat([]byte{'z'}, asyncreader.BufferSize)...)
+	nonReplayableIn := io.NopCloser(bytes.NewBuffer(payload))
+	transfer := accounting.Stats(ctx).NewTransferRemoteSize("wrapped.txt", int64(len(payload)), nil, nil)
+	defer transfer.Done(ctx, nil)
+	bufferedAccount := transfer.Account(ctx, nonReplayableIn).WithBuffer()
+	require.NotNil(t, bufferedAccount.GetAsyncReader())
+
+	var attemptPayloads []string
+	runs := 0
+
+	_, err := executeUploadWithAccountFailover(f, ctx, bufferedAccount, func(attemptCtx context.Context, attemptIn io.Reader) (string, error) {
+		chunk := make([]byte, 3)
+		_, readErr := io.ReadFull(attemptIn, chunk)
+		require.NoError(t, readErr)
+		attemptPayloads = append(attemptPayloads, string(chunk))
+
+		runs++
+		return "", &accountUploadLimitError{cause: errors.New("quota"), wake: time.Time{}}
+	})
+	require.Error(t, err)
+	assert.True(t, fserrors.IsRetryError(err))
+	assert.False(t, isAccountUploadLimitError(err))
+	assert.Equal(t, 1, runs)
+	assert.Equal(t, []string{"abc"}, attemptPayloads)
+	assert.NotNil(t, bufferedAccount.GetAsyncReader())
+}
+
 func TestUploadAttemptControllerEscalatesWhenInputNotRewindable(t *testing.T) {
 	f := newTestFsForRetry(t)
 	f.opt.SleepOnUploadLimit = true
@@ -2722,12 +2900,15 @@ func TestUploadAttemptControllerEscalatesWhenInputNotRewindable(t *testing.T) {
 		nowFn:    f.nowFn,
 	}
 
+	runs := 0
 	_, err := executeUploadWithAccountFailover(f, context.Background(), io.NopCloser(strings.NewReader("abc")), func(attemptCtx context.Context, attemptIn io.Reader) (string, error) {
+		runs++
 		return "", &accountUploadLimitError{cause: errors.New("quota"), wake: time.Time{}}
 	})
 	require.Error(t, err)
 	assert.True(t, fserrors.IsRetryError(err))
 	assert.False(t, isAccountUploadLimitError(err))
+	assert.Equal(t, 1, runs)
 }
 
 func TestPutUncheckedUsesAnotherAccountAfterReactiveUploadLimit(t *testing.T) {
