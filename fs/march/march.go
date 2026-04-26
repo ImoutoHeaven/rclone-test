@@ -4,6 +4,7 @@ package march
 import (
 	"cmp"
 	"context"
+	"errors"
 	"fmt"
 	"path"
 	"slices"
@@ -44,6 +45,31 @@ type March struct {
 	srcListDir listDirFn // function to call to list a directory in the src
 	dstListDir listDirFn // function to call to list a directory in the dst
 	transforms []matchTransformFn
+}
+
+func sortToChan(ctx context.Context, out chan<- fs.DirEntry) fs.ListRCallback {
+	return func(entries fs.DirEntries) error {
+		for _, entry := range entries {
+			select {
+			case out <- entry:
+			case <-ctx.Done():
+				return ctx.Err()
+			}
+		}
+		return nil
+	}
+}
+
+func startSorterReplay(sorter *list.Sorter, out chan fs.DirEntry) func() error {
+	errCh := make(chan error, 1)
+	go func() {
+		defer close(out)
+		defer close(errCh)
+		errCh <- sorter.Send()
+	}()
+	return func() error {
+		return <-errCh
+	}
 }
 
 // Marcher is called on each match
@@ -385,172 +411,286 @@ func (m *March) processJob(job listDirJob) ([]listDirJob, error) {
 		wg                     sync.WaitGroup
 		ci                     = fs.GetConfig(m.Ctx)
 	)
+	reportSrcListErr := func(err error) error {
+		if err == nil {
+			return nil
+		}
+		if job.srcRemote != "" {
+			fs.Errorf(job.srcRemote, "error reading source directory: %v", err)
+		} else {
+			fs.Errorf(m.Fsrc, "error reading source root directory: %v", err)
+		}
+		return fs.CountError(m.Ctx, err)
+	}
+	reportDstListErr := func(err error) error {
+		if !m.NoTraverse && err == fs.ErrorDirNotFound {
+			return nil
+		}
+		if err == nil {
+			return nil
+		}
+		if m.NoTraverse {
+			if job.dstRemote != "" {
+				fs.Errorf(job.dstRemote, "error looking up destination object: %v", err)
+			} else {
+				fs.Errorf(m.Fdst, "error looking up destination root object: %v", err)
+			}
+		} else if job.dstRemote != "" {
+			fs.Errorf(job.dstRemote, "error reading destination directory: %v", err)
+		} else {
+			fs.Errorf(m.Fdst, "error reading destination root directory: %v", err)
+		}
+		return fs.CountError(m.Ctx, err)
+	}
+	newReplaySorter := func(f fs.Fs, keyFn list.KeyFn, out chan fs.DirEntry) (*list.Sorter, error) {
+		return list.NewSorter(m.Ctx, f, sortToChan(m.Ctx, out), keyFn)
+	}
 
-	// List the src and dst directories
+	var srcLookupChan chan fs.DirEntry
+	if m.NoTraverse && !m.NoCheckDest && !job.noSrc {
+		srcLookupChan = make(chan fs.DirEntry, 100)
+	}
+
+	var err error
+	var srcSorter *list.Sorter
 	if !job.noSrc {
-		srcChan := srcChan // duplicate this as we may override it later
+		out := srcChan
+		if srcLookupChan != nil {
+			out = srcLookupChan
+		}
+		srcSorter, err = newReplaySorter(m.Fsrc, m.srcKey, out)
+		if err != nil {
+			return nil, err
+		}
+		defer srcSorter.CleanUp()
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
 			srcListErr = m.srcListDir(job.srcRemote, func(entries fs.DirEntries) error {
-				for _, entry := range entries {
-					srcChan <- entry
-				}
-				return nil
+				return srcSorter.Add(entries)
 			})
-			close(srcChan)
 		}()
-	} else {
-		close(srcChan)
 	}
-	startedDst := false
+
+	var dstSorter *list.Sorter
 	if !m.NoTraverse && !job.noDst {
-		startedDst = true
+		dstSorter, err = newReplaySorter(m.Fdst, m.dstKey, dstChan)
+		if err != nil {
+			return nil, err
+		}
+		defer dstSorter.CleanUp()
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
 			dstListErr = m.dstListDir(job.dstRemote, func(entries fs.DirEntries) error {
-				for _, entry := range entries {
-					dstChan <- entry
-				}
-				return nil
+				return dstSorter.Add(entries)
 			})
-			close(dstChan)
 		}()
 	}
-	// If NoTraverse is set, then try to find a matching object
-	// for each item in the srcList to head dst object
-	if m.NoTraverse && !m.NoCheckDest {
-		startedDst = true
-		workers := ci.Checkers
-		originalSrcChan := srcChan
-		srcChan = make(chan fs.DirEntry, 100)
 
-		type matchTask struct {
-			src      fs.DirEntry        // src object to find in destination
-			dstMatch chan<- fs.DirEntry // channel to receive matching dst object or nil
-		}
-		matchTasks := make(chan matchTask, workers)
-		dstMatches := make(chan (<-chan fs.DirEntry), workers)
-
-		// Create the tasks from the originalSrcChan. These are put into matchTasks for
-		// processing and dstMatches so they can be retrieved in order.
-		go func() {
-			for src := range originalSrcChan {
-				srcChan <- src
-				dstMatch := make(chan fs.DirEntry, 1)
-				matchTasks <- matchTask{
-					src:      src,
-					dstMatch: dstMatch,
-				}
-				dstMatches <- dstMatch
+	wg.Wait()
+	if err = reportSrcListErr(srcListErr); err != nil {
+		return nil, err
+	}
+	if err = reportDstListErr(dstListErr); err != nil {
+		return nil, err
+	}
+	runMatch := func(srcEntries, dstEntries <-chan fs.DirEntry) error {
+		return m.matchListings(srcEntries, dstEntries, func(src fs.DirEntry) {
+			recurse := m.Callback.SrcOnly(src)
+			if recurse && job.srcDepth > 0 {
+				jobs = append(jobs, listDirJob{
+					srcRemote: src.Remote(),
+					dstRemote: src.Remote(),
+					srcDepth:  job.srcDepth - 1,
+					noDst:     true,
+				})
 			}
-			close(matchTasks)
-		}()
+		}, func(dst fs.DirEntry) {
+			recurse := m.Callback.DstOnly(dst)
+			if recurse && job.dstDepth > 0 {
+				jobs = append(jobs, listDirJob{
+					srcRemote: dst.Remote(),
+					dstRemote: dst.Remote(),
+					dstDepth:  job.dstDepth - 1,
+					noSrc:     true,
+				})
+			}
+		}, func(dst, src fs.DirEntry) {
+			recurse := m.Callback.Match(m.Ctx, dst, src)
+			if recurse && job.srcDepth > 0 && job.dstDepth > 0 {
+				jobs = append(jobs, listDirJob{
+					srcRemote: src.Remote(),
+					dstRemote: dst.Remote(),
+					srcDepth:  job.srcDepth - 1,
+					dstDepth:  job.dstDepth - 1,
+				})
+			}
+		})
+	}
+	if m.NoTraverse && !m.NoCheckDest {
+		if job.noSrc {
+			return jobs, nil
+		}
+		type noTraverseLookupResult struct {
+			dst fs.Object
+			err error
+		}
+		type noTraverseLookupTask struct {
+			src    fs.Object
+			result chan<- noTraverseLookupResult
+		}
+		type noTraversePending struct {
+			src      fs.DirEntry
+			resultCh <-chan noTraverseLookupResult
+		}
 
-		// Get the tasks from the queue and find a matching object.
+		workers := ci.Checkers
+		if workers < 1 {
+			workers = 1
+		}
+		matchTasks := make(chan noTraverseLookupTask, workers)
 		var workerWg sync.WaitGroup
 		for range workers {
 			workerWg.Add(1)
 			go func() {
 				defer workerWg.Done()
-				for t := range matchTasks {
-					// Can't match directories with NewObject
-					if _, ok := t.src.(fs.Object); !ok {
-						t.dstMatch <- nil
-						continue
-					}
-					leaf := path.Base(t.src.Remote())
+				for task := range matchTasks {
+					leaf := path.Base(task.src.Remote())
 					dst, err := m.Fdst.NewObject(m.Ctx, path.Join(job.dstRemote, leaf))
-					if err != nil {
-						dst = nil
+					switch {
+					case errors.Is(err, fs.ErrorObjectNotFound):
+						task.result <- noTraverseLookupResult{}
+					// Preserve historic mixed object-plus-error behavior in default mode.
+					case err != nil && dst != nil:
+						task.result <- noTraverseLookupResult{}
+					case err != nil:
+						task.result <- noTraverseLookupResult{err: err}
+					case dst != nil:
+						task.result <- noTraverseLookupResult{dst: dst}
+					default:
+						task.result <- noTraverseLookupResult{}
 					}
-					t.dstMatch <- dst
+					close(task.result)
 				}
 			}()
 		}
 
-		// Close dstResults when all the workers have finished
-		go func() {
-			workerWg.Wait()
-			close(dstMatches)
-		}()
-
-		// Read the matches in order and send them to dstChan if found.
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			for dstMatch := range dstMatches {
-				dst := <-dstMatch
-				// Note that dst may be nil here
-				// We send these on so we don't deadlock the reader
-				dstChan <- dst
+		replayLookupErr := startSorterReplay(srcSorter, srcLookupChan)
+		pending := make([]noTraversePending, 0, 128)
+		for src := range srcLookupChan {
+			pendingEntry := noTraversePending{src: src}
+			if obj, ok := src.(fs.Object); ok {
+				resultCh := make(chan noTraverseLookupResult, 1)
+				pendingEntry.resultCh = resultCh
+				matchTasks <- noTraverseLookupTask{src: obj, result: resultCh}
 			}
-			close(srcChan)
-			close(dstChan)
-		}()
+			pending = append(pending, pendingEntry)
+		}
+		close(matchTasks)
+		workerWg.Wait()
+
+		if err = reportSrcListErr(replayLookupErr()); err != nil {
+			return nil, err
+		}
+
+		results := make([]noTraverseLookupResult, len(pending))
+		for i, entry := range pending {
+			if entry.resultCh == nil {
+				continue
+			}
+			results[i] = <-entry.resultCh
+			if dstListErr == nil && results[i].err != nil {
+				dstListErr = results[i].err
+			}
+		}
+		if err = reportDstListErr(dstListErr); err != nil {
+			return nil, err
+		}
+
+		var prevMatchedDst fs.DirEntry
+		var prevMatchedDstKey string
+		var prevMatchedSrc fs.DirEntry
+		var prevMatchedSrcKey string
+		var prevSrcOnly fs.DirEntry
+		var prevSrcOnlyKey string
+		for i, entry := range pending {
+			currSrcKey := m.srcKey(entry.src)
+			if results[i].dst == nil {
+				if prevMatchedSrc != nil && currSrcKey == prevMatchedSrcKey && fs.DirEntryType(entry.src) == fs.DirEntryType(prevMatchedSrc) {
+					fs.Logf(entry.src, "Duplicate %s found in source - ignoring", fs.DirEntryType(entry.src))
+					continue
+				}
+				if prevSrcOnly != nil && currSrcKey == prevSrcOnlyKey && fs.DirEntryType(entry.src) == fs.DirEntryType(prevSrcOnly) {
+					fs.Logf(entry.src, "Duplicate %s found in source - ignoring", fs.DirEntryType(entry.src))
+					continue
+				}
+				recurse := m.Callback.SrcOnly(entry.src)
+				prevSrcOnly = entry.src
+				prevSrcOnlyKey = currSrcKey
+				if recurse && job.srcDepth > 0 {
+					jobs = append(jobs, listDirJob{
+						srcRemote: entry.src.Remote(),
+						dstRemote: entry.src.Remote(),
+						srcDepth:  job.srcDepth - 1,
+						noDst:     true,
+					})
+				}
+				continue
+			}
+			prevSrcOnly = nil
+			prevSrcOnlyKey = ""
+			currDstKey := m.dstKey(results[i].dst)
+			if prevMatchedDst != nil && currDstKey == prevMatchedDstKey && fs.DirEntryType(results[i].dst) == fs.DirEntryType(prevMatchedDst) {
+				fs.Logf(entry.src, "Duplicate %s found in source - ignoring", fs.DirEntryType(entry.src))
+				continue
+			}
+			recurse := m.Callback.Match(m.Ctx, results[i].dst, entry.src)
+			prevMatchedDst = results[i].dst
+			prevMatchedDstKey = currDstKey
+			prevMatchedSrc = entry.src
+			prevMatchedSrcKey = currSrcKey
+			if recurse && job.srcDepth > 0 && job.dstDepth > 0 {
+				jobs = append(jobs, listDirJob{
+					srcRemote: entry.src.Remote(),
+					dstRemote: results[i].dst.Remote(),
+					srcDepth:  job.srcDepth - 1,
+					dstDepth:  job.dstDepth - 1,
+				})
+			}
+		}
+		return jobs, nil
 	}
-	if !startedDst {
+
+	replaySrcErr := func() error { return nil }
+	replayDstErr := func() error { return nil }
+	dstReplayStarted := false
+
+	if job.noSrc {
+		close(srcChan)
+	} else {
+		replaySrcErr = startSorterReplay(srcSorter, srcChan)
+	}
+
+	if !dstReplayStarted && (m.NoTraverse || job.noDst || dstListErr == fs.ErrorDirNotFound) {
 		close(dstChan)
+	} else if !dstReplayStarted {
+		replayDstErr = startSorterReplay(dstSorter, dstChan)
 	}
 
 	// Work out what to do and do it
-	err := m.matchListings(srcChan, dstChan, func(src fs.DirEntry) {
-		recurse := m.Callback.SrcOnly(src)
-		if recurse && job.srcDepth > 0 {
-			jobs = append(jobs, listDirJob{
-				srcRemote: src.Remote(),
-				dstRemote: src.Remote(),
-				srcDepth:  job.srcDepth - 1,
-				noDst:     true,
-			})
-		}
-	}, func(dst fs.DirEntry) {
-		recurse := m.Callback.DstOnly(dst)
-		if recurse && job.dstDepth > 0 {
-			jobs = append(jobs, listDirJob{
-				srcRemote: dst.Remote(),
-				dstRemote: dst.Remote(),
-				dstDepth:  job.dstDepth - 1,
-				noSrc:     true,
-			})
-		}
-	}, func(dst, src fs.DirEntry) {
-		recurse := m.Callback.Match(m.Ctx, dst, src)
-		if recurse && job.srcDepth > 0 && job.dstDepth > 0 {
-			jobs = append(jobs, listDirJob{
-				srcRemote: src.Remote(),
-				dstRemote: dst.Remote(),
-				srcDepth:  job.srcDepth - 1,
-				dstDepth:  job.dstDepth - 1,
-			})
-		}
-	})
+	err = runMatch(srcChan, dstChan)
 	if err != nil {
 		return nil, err
 	}
-
-	// Wait for listings to complete and report errors
-	wg.Wait()
-	if srcListErr != nil {
-		if job.srcRemote != "" {
-			fs.Errorf(job.srcRemote, "error reading source directory: %v", srcListErr)
-		} else {
-			fs.Errorf(m.Fsrc, "error reading source root directory: %v", srcListErr)
-		}
-		srcListErr = fs.CountError(m.Ctx, srcListErr)
-		return nil, srcListErr
+	if sendErr := replaySrcErr(); err == nil && sendErr != nil {
+		err = sendErr
 	}
-	if dstListErr == fs.ErrorDirNotFound {
-		// Copy the stuff anyway
-	} else if dstListErr != nil {
-		if job.dstRemote != "" {
-			fs.Errorf(job.dstRemote, "error reading destination directory: %v", dstListErr)
-		} else {
-			fs.Errorf(m.Fdst, "error reading destination root directory: %v", dstListErr)
-		}
-		dstListErr = fs.CountError(m.Ctx, dstListErr)
-		return nil, dstListErr
+	if sendErr := replayDstErr(); err == nil && sendErr != nil {
+		err = sendErr
+	}
+	if err != nil {
+		return nil, err
 	}
 
 	return jobs, nil

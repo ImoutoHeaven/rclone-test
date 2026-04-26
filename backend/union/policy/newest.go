@@ -24,6 +24,7 @@ func (p *Newest) newest(ctx context.Context, upstreams []*upstream.Fs, filePath 
 	var wg sync.WaitGroup
 	ufs := make([]*upstream.Fs, len(upstreams))
 	mtimes := make([]time.Time, len(upstreams))
+	errs := make([]error, len(upstreams))
 	for i, u := range upstreams {
 		wg.Add(1)
 		i, u := i, u // Closure
@@ -31,13 +32,23 @@ func (p *Newest) newest(ctx context.Context, upstreams []*upstream.Fs, filePath 
 			defer wg.Done()
 			rfs := u.RootFs
 			remote := path.Join(u.RootPath, filePath)
-			if e := findEntry(ctx, rfs, remote); e != nil {
+			probe, err := findEntry(ctx, rfs, remote)
+			if shouldFailClosedOnProbeError(u, err) {
+				errs[i] = err
+				return
+			}
+			if probe.found {
 				ufs[i] = u
-				mtimes[i] = e.ModTime(ctx)
+				mtimes[i] = probe.entry.ModTime(ctx)
 			}
 		}()
 	}
 	wg.Wait()
+	for _, err := range errs {
+		if err != nil {
+			return nil, err
+		}
+	}
 	maxMtime := time.Time{}
 	var newestFs *upstream.Fs
 	for i, u := range ufs {

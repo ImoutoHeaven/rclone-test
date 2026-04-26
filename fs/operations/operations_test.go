@@ -955,6 +955,24 @@ func TestMoveFile(t *testing.T) {
 	r.CheckRemoteItems(t, file2)
 }
 
+func TestMoveFileStrictUnionLookupDoesNotCollapseFailureIntoNotFound(t *testing.T) {
+	ctx := context.Background()
+	r := fstest.NewRun(t)
+	fdst, emptyDst := newStrictUnionLookupFailingDst(t)
+
+	file1 := r.WriteFile("file1", "file1 contents", t1)
+	r.CheckLocalItems(t, file1)
+
+	err := operations.MoveFile(ctx, fdst, r.Flocal, file1.Path, file1.Path)
+	require.Error(t, err)
+	assert.ErrorIs(t, err, errStrictUnionLookupFailed)
+	assert.False(t, errors.Is(err, fs.ErrorObjectNotFound))
+
+	_, lookupErr := emptyDst.NewObject(ctx, file1.Path)
+	assert.ErrorIs(t, lookupErr, fs.ErrorObjectNotFound)
+	r.CheckLocalItems(t, file1)
+}
+
 func TestMoveFileWithIgnoreExisting(t *testing.T) {
 	ctx := context.Background()
 	ctx, ci := fs.AddConfig(ctx)

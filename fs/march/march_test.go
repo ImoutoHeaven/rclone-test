@@ -18,6 +18,7 @@ import (
 	"github.com/rclone/rclone/fs/walk"
 	"github.com/rclone/rclone/fstest"
 	"github.com/rclone/rclone/fstest/mockdir"
+	"github.com/rclone/rclone/fstest/mockfs"
 	"github.com/rclone/rclone/fstest/mockobject"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -272,6 +273,273 @@ func TestMarch(t *testing.T) {
 			fstest.CompareItems(t, mt.match, match, test.dirMatch, precision, "match")
 		})
 	}
+}
+
+type errNewObjectFs struct {
+	fs.Fs
+	err error
+}
+
+func (f *errNewObjectFs) NewObject(ctx context.Context, remote string) (fs.Object, error) {
+	return nil, f.err
+}
+
+type newObjectFuncFs struct {
+	fs.Fs
+	newObject func(context.Context, string) (fs.Object, error)
+}
+
+func (f *newObjectFuncFs) NewObject(ctx context.Context, remote string) (fs.Object, error) {
+	return f.newObject(ctx, remote)
+}
+
+func newMarchProcessJobTestFs(t *testing.T, name string) fs.Fs {
+	t.Helper()
+
+	f, err := mockfs.NewFs(context.Background(), name, "", nil)
+	require.NoError(t, err)
+
+	return f
+}
+
+func newMarchProcessJobTest(t *testing.T, noTraverse bool, srcListDir, dstListDir listDirFn, fdst fs.Fs) (*March, *marchTester) {
+	t.Helper()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	ctx, ci := fs.AddConfig(ctx)
+	ci.Checkers = 4
+
+	if fdst == nil {
+		fdst = newMarchProcessJobTestFs(t, "dst")
+	}
+
+	mt := &marchTester{
+		ctx:        ctx,
+		cancel:     cancel,
+		noTraverse: noTraverse,
+	}
+
+	t.Cleanup(cancel)
+
+	return &March{
+		Ctx:        ctx,
+		Fdst:       fdst,
+		Fsrc:       newMarchProcessJobTestFs(t, "src"),
+		NoTraverse: noTraverse,
+		Callback:   mt,
+		srcListDir: srcListDir,
+		dstListDir: dstListDir,
+	}, mt
+}
+
+// Inject listDirFn directly so the test can reproduce upstreams that emit
+// entries before returning a final error.
+func listDirWith(entries fs.DirEntries, err error) listDirFn {
+	return func(dir string, callback fs.ListRCallback) error {
+		if len(entries) > 0 {
+			if cbErr := callback(entries); cbErr != nil {
+				return cbErr
+			}
+		}
+		return err
+	}
+}
+
+func TestMarchTraversalPropagatesSourceListingErrorBeforeMatchProcessing(t *testing.T) {
+	boom := errors.New("source listing failed")
+	entry := mockobject.Object("match.txt")
+
+	m, mt := newMarchProcessJobTest(t, false, listDirWith(fs.DirEntries{entry}, boom), listDirWith(fs.DirEntries{entry}, nil), nil)
+	_, err := m.processJob(listDirJob{})
+
+	require.Error(t, err)
+	assert.ErrorIs(t, err, boom)
+	assert.Empty(t, mt.srcOnly)
+	assert.Empty(t, mt.dstOnly)
+	assert.Empty(t, mt.match)
+}
+
+func TestMarchTraversalPropagatesDestinationListingErrorBeforeMatchProcessing(t *testing.T) {
+	boom := errors.New("destination listing failed")
+	entry := mockobject.Object("match.txt")
+
+	m, mt := newMarchProcessJobTest(t, false, listDirWith(fs.DirEntries{entry}, nil), listDirWith(fs.DirEntries{entry}, boom), nil)
+	_, err := m.processJob(listDirJob{})
+
+	require.Error(t, err)
+	assert.ErrorIs(t, err, boom)
+	assert.Empty(t, mt.srcOnly)
+	assert.Empty(t, mt.dstOnly)
+	assert.Empty(t, mt.match)
+}
+
+func TestMarchTraversalDoesNotDriveDstOnlyFromFailedSourceListing(t *testing.T) {
+	boom := errors.New("source listing failed")
+	dstOnlyEntry := mockobject.Object("dst-only.txt")
+
+	m, mt := newMarchProcessJobTest(t, false, listDirWith(nil, boom), listDirWith(fs.DirEntries{dstOnlyEntry}, nil), nil)
+	_, err := m.processJob(listDirJob{})
+
+	require.Error(t, err)
+	assert.ErrorIs(t, err, boom)
+	assert.Empty(t, mt.dstOnly)
+}
+
+func TestMarchNoTraversePropagatesDestinationLookupError(t *testing.T) {
+	boom := errors.New("destination lookup failed")
+	entry := mockobject.Object("src-only.txt")
+	dst := &errNewObjectFs{Fs: newMarchProcessJobTestFs(t, "dst"), err: boom}
+
+	m, _ := newMarchProcessJobTest(t, true, listDirWith(fs.DirEntries{entry}, nil), nil, dst)
+	_, err := m.processJob(listDirJob{})
+
+	require.Error(t, err)
+	assert.ErrorIs(t, err, boom)
+}
+
+func TestMarchNoTraversePreservesDefaultMixedLookupBehavior(t *testing.T) {
+	boom := errors.New("destination lookup failed after object was found")
+	src := mockobject.Object("match.txt")
+	dstObj := mockobject.New("match.txt")
+
+	dstFS := &newObjectFuncFs{
+		Fs: newMarchProcessJobTestFs(t, "dst"),
+		newObject: func(ctx context.Context, remote string) (fs.Object, error) {
+			return dstObj, boom
+		},
+	}
+
+	m, mt := newMarchProcessJobTest(t, true, listDirWith(fs.DirEntries{src}, nil), nil, dstFS)
+	_, err := m.processJob(listDirJob{})
+
+	require.NoError(t, err)
+	assert.Equal(t, fs.DirEntries{src}, mt.srcOnly)
+	assert.Empty(t, mt.match)
+	assert.Empty(t, mt.dstOnly)
+}
+
+func TestMarchNoTraverseDoesNotTreatDestinationDirNotFoundAsMissing(t *testing.T) {
+	entry := mockobject.Object("src-only.txt")
+	dst := &errNewObjectFs{Fs: newMarchProcessJobTestFs(t, "dst"), err: fs.ErrorDirNotFound}
+
+	m, mt := newMarchProcessJobTest(t, true, listDirWith(fs.DirEntries{entry}, nil), nil, dst)
+	_, err := m.processJob(listDirJob{})
+
+	require.Error(t, err)
+	assert.ErrorIs(t, err, fs.ErrorDirNotFound)
+	assert.Empty(t, mt.srcOnly)
+	assert.Empty(t, mt.dstOnly)
+	assert.Empty(t, mt.match)
+}
+
+func TestMarchNoTraversePreservesSourceLookupAssociationForCollidingKeys(t *testing.T) {
+	srcUpper := mockobject.Object("A")
+	srcLower := mockobject.Object("a")
+	dstObj := mockobject.New("a")
+
+	dstFS := &newObjectFuncFs{
+		Fs: newMarchProcessJobTestFs(t, "dst"),
+		newObject: func(ctx context.Context, remote string) (fs.Object, error) {
+			switch remote {
+			case "A":
+				return nil, fs.ErrorObjectNotFound
+			case "a":
+				return dstObj, nil
+			default:
+				return nil, fs.ErrorObjectNotFound
+			}
+		},
+	}
+
+	m, mt := newMarchProcessJobTest(t, true, listDirWith(fs.DirEntries{srcUpper, srcLower}, nil), nil, dstFS)
+	m.transforms = []matchTransformFn{strings.ToLower}
+	_, err := m.processJob(listDirJob{})
+
+	require.NoError(t, err)
+	assert.Equal(t, fs.DirEntries{srcUpper}, mt.srcOnly)
+	if assert.Len(t, mt.match, 1) {
+		assert.Equal(t, srcLower, mt.match[0])
+	}
+	assert.Empty(t, mt.dstOnly)
+}
+
+func TestMarchNoTraverseSuppressesDuplicateMatchesForCollidingKeys(t *testing.T) {
+	srcUpper := mockobject.Object("A")
+	srcLower := mockobject.Object("a")
+	dstObj := mockobject.New("a")
+
+	dstFS := &newObjectFuncFs{
+		Fs: newMarchProcessJobTestFs(t, "dst"),
+		newObject: func(ctx context.Context, remote string) (fs.Object, error) {
+			if strings.EqualFold(remote, "a") {
+				return dstObj, nil
+			}
+			return nil, fs.ErrorObjectNotFound
+		},
+	}
+
+	m, mt := newMarchProcessJobTest(t, true, listDirWith(fs.DirEntries{srcUpper, srcLower}, nil), nil, dstFS)
+	m.transforms = []matchTransformFn{strings.ToLower}
+	_, err := m.processJob(listDirJob{})
+
+	require.NoError(t, err)
+	assert.Empty(t, mt.srcOnly)
+	if assert.Len(t, mt.match, 1) {
+		assert.Equal(t, srcUpper, mt.match[0])
+	}
+	assert.Empty(t, mt.dstOnly)
+}
+
+func TestMarchNoTraverseSuppressesDuplicateSrcOnlyForCollidingMisses(t *testing.T) {
+	srcUpper := mockobject.Object("A")
+	srcLower := mockobject.Object("a")
+
+	dstFS := &newObjectFuncFs{
+		Fs: newMarchProcessJobTestFs(t, "dst"),
+		newObject: func(ctx context.Context, remote string) (fs.Object, error) {
+			return nil, fs.ErrorObjectNotFound
+		},
+	}
+
+	m, mt := newMarchProcessJobTest(t, true, listDirWith(fs.DirEntries{srcUpper, srcLower}, nil), nil, dstFS)
+	m.transforms = []matchTransformFn{strings.ToLower}
+	_, err := m.processJob(listDirJob{})
+
+	require.NoError(t, err)
+	assert.Equal(t, fs.DirEntries{srcUpper}, mt.srcOnly)
+	assert.Empty(t, mt.match)
+	assert.Empty(t, mt.dstOnly)
+}
+
+func TestMarchNoTraverseSuppressesDuplicateSrcOnlyAfterCollidingMatch(t *testing.T) {
+	srcUpper := mockobject.Object("A")
+	srcLower := mockobject.Object("a")
+	dstObj := mockobject.New("A")
+
+	dstFS := &newObjectFuncFs{
+		Fs: newMarchProcessJobTestFs(t, "dst"),
+		newObject: func(ctx context.Context, remote string) (fs.Object, error) {
+			switch remote {
+			case "A":
+				return dstObj, nil
+			case "a":
+				return nil, fs.ErrorObjectNotFound
+			default:
+				return nil, fs.ErrorObjectNotFound
+			}
+		},
+	}
+
+	m, mt := newMarchProcessJobTest(t, true, listDirWith(fs.DirEntries{srcUpper, srcLower}, nil), nil, dstFS)
+	m.transforms = []matchTransformFn{strings.ToLower}
+	_, err := m.processJob(listDirJob{})
+
+	require.NoError(t, err)
+	assert.Empty(t, mt.srcOnly)
+	if assert.Len(t, mt.match, 1) {
+		assert.Equal(t, srcUpper, mt.match[0])
+	}
+	assert.Empty(t, mt.dstOnly)
 }
 
 // matchPair is a matched pair of direntries returned by matchListings

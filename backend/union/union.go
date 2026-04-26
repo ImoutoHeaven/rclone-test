@@ -61,6 +61,10 @@ If a remote has less than this much free space then it won't be
 considered for use in lfs or eplfs policies.`,
 			Advanced: true,
 			Default:  fs.Gibi,
+		}, {
+			Name:    "strict_reads",
+			Help:    "Fail closed on upstream read or lookup errors instead of returning partial results.",
+			Default: false,
 		}},
 	}
 	fs.Register(fsi)
@@ -697,6 +701,14 @@ func (f *Fs) List(ctx context.Context, dir string) (entries fs.DirEntries, err e
 		}
 		entriesList[i] = uEntries
 	})
+	if f.opt.StrictReads && f.hasStrictReadFailure(errs, fs.ErrorDirNotFound) {
+		return nil, errs.Map(func(e error) error {
+			if errors.Is(e, fs.ErrorDirNotFound) {
+				return nil
+			}
+			return e
+		}).Err()
+	}
 	if len(errs) == len(errs.FilterNil()) {
 		errs = errs.Map(func(e error) error {
 			if errors.Is(e, fs.ErrorDirNotFound) {
@@ -731,6 +743,7 @@ func (f *Fs) List(ctx context.Context, dir string) (entries fs.DirEntries, err e
 func (f *Fs) ListR(ctx context.Context, dir string, callback fs.ListRCallback) (err error) {
 	var entriesList [][]upstream.Entry
 	errs := Errors(make([]error, len(f.upstreams)))
+	partialResults := make([]bool, len(f.upstreams))
 	var mutex sync.Mutex
 	multithread(len(f.upstreams), func(i int) {
 		u := f.upstreams[i]
@@ -740,6 +753,7 @@ func (f *Fs) ListR(ctx context.Context, dir string, callback fs.ListRCallback) (
 			for j, e := range entries {
 				uEntries[j], _ = u.WrapEntry(e)
 			}
+			partialResults[i] = true
 			mutex.Lock()
 			entriesList = append(entriesList, uEntries)
 			mutex.Unlock()
@@ -756,6 +770,9 @@ func (f *Fs) ListR(ctx context.Context, dir string, callback fs.ListRCallback) (
 			return
 		}
 	})
+	if strictErrs := f.strictListRErrors(errs, fs.ErrorDirNotFound, partialResults); len(strictErrs) > 0 {
+		return strictErrs.Err()
+	}
 	if len(errs) == len(errs.FilterNil()) {
 		errs = errs.Map(func(e error) error {
 			if errors.Is(e, fs.ErrorDirNotFound) {
@@ -782,12 +799,20 @@ func (f *Fs) NewObject(ctx context.Context, remote string) (fs.Object, error) {
 	multithread(len(f.upstreams), func(i int) {
 		u := f.upstreams[i]
 		o, err := u.NewObject(ctx, remote)
-		if err != nil && err != fs.ErrorObjectNotFound {
+		if err != nil && !errors.Is(err, fs.ErrorObjectNotFound) {
 			errs[i] = fmt.Errorf("%s: %w", u.Name(), err)
 			return
 		}
 		objs[i] = u.WrapObject(o)
 	})
+	if f.opt.StrictReads && f.hasStrictReadFailure(errs, fs.ErrorObjectNotFound) {
+		return nil, errs.Map(func(e error) error {
+			if errors.Is(e, fs.ErrorObjectNotFound) {
+				return nil
+			}
+			return e
+		}).Err()
+	}
 	var entries []upstream.Entry
 	for _, o := range objs {
 		if o != nil {
@@ -829,6 +854,50 @@ func (f *Fs) create(ctx context.Context, path string) ([]*upstream.Fs, error) {
 
 func (f *Fs) searchEntries(entries ...upstream.Entry) (upstream.Entry, error) {
 	return f.searchPolicy.SearchEntries(entries...)
+}
+
+func (f *Fs) strictReadFailure(err error, cleanAbsence error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, cleanAbsence) {
+		return false
+	}
+	return f.opt.StrictReads
+}
+
+func (f *Fs) hasStrictReadFailure(errs Errors, cleanAbsence error) bool {
+	for _, err := range errs {
+		if f.strictReadFailure(err, cleanAbsence) {
+			return true
+		}
+	}
+	return false
+}
+
+func (f *Fs) strictListRFailure(err error, cleanAbsence error, emittedEntries bool) bool {
+	if err == nil {
+		return false
+	}
+	if emittedEntries {
+		return f.opt.StrictReads
+	}
+	return f.strictReadFailure(err, cleanAbsence)
+}
+
+func (f *Fs) strictListRErrors(errs Errors, cleanAbsence error, emittedEntries []bool) Errors {
+	strictErrs := make(Errors, 0, len(errs))
+	for i, err := range errs {
+		if !f.strictListRFailure(err, cleanAbsence, emittedEntries[i]) {
+			continue
+		}
+		if emittedEntries[i] && errors.Is(err, cleanAbsence) {
+			strictErrs = append(strictErrs, fmt.Errorf("partial recursive listing failed after emitting entries: %v", err))
+			continue
+		}
+		strictErrs = append(strictErrs, err)
+	}
+	return strictErrs
 }
 
 func (f *Fs) mergeDirEntries(entriesList [][]upstream.Entry) (fs.DirEntries, error) {

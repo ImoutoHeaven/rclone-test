@@ -10,16 +10,67 @@ import (
 	"runtime"
 	"sort"
 	"strings"
+	stdsync "sync"
 	"testing"
 
+	_ "github.com/rclone/rclone/backend/local"
+	_ "github.com/rclone/rclone/backend/union"
 	"github.com/rclone/rclone/fs"
 	"github.com/rclone/rclone/fs/accounting"
+	"github.com/rclone/rclone/fs/config/configmap"
 	"github.com/rclone/rclone/fs/operations"
 	"github.com/rclone/rclone/fs/sync"
 	"github.com/rclone/rclone/fstest"
+	"github.com/rclone/rclone/fstest/mockfs"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
+
+var (
+	errStrictUnionLookupFailed = errors.New("strict union destination lookup failed")
+	registerStrictLookupFail   stdsync.Once
+)
+
+type strictLookupFailFs struct {
+	*mockfs.Fs
+}
+
+func (f *strictLookupFailFs) NewObject(ctx context.Context, remote string) (fs.Object, error) {
+	return nil, errStrictUnionLookupFailed
+}
+
+func registerStrictLookupFailBackend() {
+	registerStrictLookupFail.Do(func() {
+		fs.Register(&fs.RegInfo{
+			Name:        "tg3faillookup",
+			Description: "Always fails object lookups",
+			NewFs: func(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, error) {
+				base, err := mockfs.NewFs(ctx, name, root, nil)
+				if err != nil {
+					return nil, err
+				}
+				return &strictLookupFailFs{Fs: base.(*mockfs.Fs)}, nil
+			},
+		})
+	})
+}
+
+func newStrictUnionLookupFailingDst(t *testing.T) (fs.Fs, fs.Fs) {
+	t.Helper()
+
+	ctx := context.Background()
+	registerStrictLookupFailBackend()
+
+	emptyDir := t.TempDir()
+	emptyDst, err := fs.NewFs(ctx, emptyDir)
+	require.NoError(t, err)
+
+	unionString := fmt.Sprintf(":union,upstreams='%s :tg3faillookup:',strict_reads=true:", emptyDir)
+	fdst, err := fs.NewFs(ctx, unionString)
+	require.NoError(t, err)
+
+	return fdst, emptyDst
+}
 
 func TestTruncateString(t *testing.T) {
 	for _, test := range []struct {
@@ -124,6 +175,24 @@ func TestCopyFile(t *testing.T) {
 	require.NoError(t, err)
 	r.CheckLocalItems(t, file1)
 	r.CheckRemoteItems(t, file2)
+}
+
+func TestCopyFileStrictUnionLookupDoesNotCollapseFailureIntoNotFound(t *testing.T) {
+	ctx := context.Background()
+	r := fstest.NewRun(t)
+	fdst, emptyDst := newStrictUnionLookupFailingDst(t)
+
+	file1 := r.WriteFile("file1", "file1 contents", t1)
+	r.CheckLocalItems(t, file1)
+
+	err := operations.CopyFile(ctx, fdst, r.Flocal, file1.Path, file1.Path)
+	require.Error(t, err)
+	assert.ErrorIs(t, err, errStrictUnionLookupFailed)
+	assert.False(t, errors.Is(err, fs.ErrorObjectNotFound))
+
+	_, lookupErr := emptyDst.NewObject(ctx, file1.Path)
+	assert.ErrorIs(t, lookupErr, fs.ErrorObjectNotFound)
+	r.CheckLocalItems(t, file1)
 }
 
 // Find the longest file name for writing to local

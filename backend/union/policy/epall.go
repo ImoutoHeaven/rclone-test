@@ -24,19 +24,30 @@ type EpAll struct {
 func (p *EpAll) epall(ctx context.Context, upstreams []*upstream.Fs, filePath string) ([]*upstream.Fs, error) {
 	var wg sync.WaitGroup
 	ufs := make([]*upstream.Fs, len(upstreams))
+	errs := make([]error, len(upstreams))
 	for i, u := range upstreams {
 		wg.Add(1)
 		i, u := i, u // Closure
 		go func() {
+			defer wg.Done()
 			rfs := u.RootFs
 			remote := path.Join(u.RootPath, filePath)
-			if findEntry(ctx, rfs, remote) != nil {
+			probe, err := findEntry(ctx, rfs, remote)
+			if shouldFailClosedOnProbeError(u, err) {
+				errs[i] = err
+				return
+			}
+			if probe.found {
 				ufs[i] = u
 			}
-			wg.Done()
 		}()
 	}
 	wg.Wait()
+	for _, err := range errs {
+		if err != nil {
+			return nil, err
+		}
+	}
 	var results []*upstream.Fs
 	for _, f := range ufs {
 		if f != nil {

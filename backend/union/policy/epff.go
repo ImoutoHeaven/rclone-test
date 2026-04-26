@@ -3,6 +3,7 @@ package policy
 import (
 	"context"
 	"path"
+	"sync"
 
 	"github.com/rclone/rclone/backend/union/upstream"
 	"github.com/rclone/rclone/fs"
@@ -17,30 +18,58 @@ func init() {
 type EpFF struct{}
 
 func (p *EpFF) epff(ctx context.Context, upstreams []*upstream.Fs, filePath string) (*upstream.Fs, error) {
-	ch := make(chan *upstream.Fs, len(upstreams))
+	type epffResult struct {
+		u   *upstream.Fs
+		err error
+	}
+
+	ch := make(chan epffResult, len(upstreams))
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
+	var wg sync.WaitGroup
 	for _, u := range upstreams {
+		wg.Add(1)
+		u := u
 		go func() {
+			defer wg.Done()
 			rfs := u.RootFs
 			remote := path.Join(u.RootPath, filePath)
-			if findEntry(ctx, rfs, remote) == nil {
+			probe, err := findEntry(ctx, rfs, remote)
+			if shouldFailClosedOnProbeError(u, err) {
+				ch <- epffResult{err: err}
+				return
+			}
+			if !probe.found {
 				u = nil
 			}
-			ch <- u
+			ch <- epffResult{u: u}
 		}()
 	}
-	var u *upstream.Fs
-	for range upstreams {
-		u = <-ch
-		if u != nil {
-			break
+	go func() {
+		wg.Wait()
+		close(ch)
+	}()
+	var selected *upstream.Fs
+	var firstStrictErr error
+	for result := range ch {
+		if result.err != nil {
+			if firstStrictErr == nil {
+				firstStrictErr = result.err
+				cancel()
+			}
+			continue
+		}
+		if firstStrictErr == nil && selected == nil && result.u != nil {
+			selected = result.u
 		}
 	}
-	if u == nil {
+	if firstStrictErr != nil {
+		return nil, firstStrictErr
+	}
+	if selected == nil {
 		return nil, fs.ErrorObjectNotFound
 	}
-	return u, nil
+	return selected, nil
 }
 
 // Action category policy, governing the modification of files and directories
