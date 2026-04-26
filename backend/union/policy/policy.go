@@ -2,6 +2,7 @@ package policy
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"path"
 	"strings"
@@ -100,27 +101,47 @@ func clean(absPath string) string {
 	return cleanPath
 }
 
-func findEntry(ctx context.Context, f fs.Fs, remote string) fs.DirEntry {
+type probeResult struct {
+	entry fs.DirEntry
+	found bool
+}
+
+func shouldFailClosedOnProbeError(u *upstream.Fs, err error) bool {
+	return err != nil && u != nil && u.Opt != nil && u.Opt.StrictReads
+}
+
+func findEntry(ctx context.Context, f fs.Fs, remote string) (probeResult, error) {
 	remote = clean(remote)
 	dir := parentDir(remote)
 	entries, err := f.List(ctx, dir)
 	if remote == dir {
 		if err != nil {
-			return nil
+			if len(entries) == 0 && errors.Is(err, fs.ErrorDirNotFound) {
+				return probeResult{}, nil
+			}
+			return probeResult{}, err
 		}
-		return fs.NewDir("", time.Time{})
+		return probeResult{entry: fs.NewDir("", time.Time{}), found: true}, nil
 	}
-	found := false
+	var result probeResult
 	for _, e := range entries {
 		eRemote := e.Remote()
+		found := false
 		if f.Features().CaseInsensitive {
 			found = strings.EqualFold(remote, eRemote)
 		} else {
 			found = (remote == eRemote)
 		}
 		if found {
-			return e
+			result = probeResult{entry: e, found: true}
+			break
 		}
 	}
-	return nil
+	if err != nil {
+		if len(entries) == 0 && !result.found && errors.Is(err, fs.ErrorDirNotFound) {
+			return probeResult{}, nil
+		}
+		return result, err
+	}
+	return result, nil
 }
